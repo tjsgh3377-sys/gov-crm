@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "title": "고객관리 센터",
+    "programs": ["수출바우처", "혁신바우처", "소공인판로개척지원사업", "기타정부사업"],
+    "categories": ["기고객", "신규고객"]
+  },
+  "nextId": 3,
+  "customers": [
+    {
+      "id": 1, "date": "2026-03-04", "program": "수출바우처", "company": "(샘플) 가나다산업",
+      "manager": "홍길동", "contact": "010-0000-0000", "email": "sample1@example.com",
+      "inquiry": "수출바우처 홈페이지 제작 문의", "channel": "홈페이지",
+      "contracted": "계약", "amount": 3000000, "note": "샘플 데이터입니다", "images": []
+    },
+    {
+      "id": 2, "date": "2026-03-11", "program": "혁신바우처", "company": "(샘플) 라마바테크",
+      "manager": "김철수", "contact": "010-0000-0001", "email": "sample2@example.com",
+      "inquiry": "브로슈어 디자인 견적 요청", "channel": "전화",
+      "contracted": "진행중", "amount": 0, "note": "", "images": []
+    }
+  ],
+  "nextGenId": 2,
+  "genCustomers": [
+    {
+      "id": 1, "date": "2026-02-20", "category": "신규고객", "company": "(샘플) 사아자상사",
+      "manager": "이영희", "contact": "010-0000-0002", "email": "sample3@example.com",
+      "inquiry": "명함·리플렛 문의", "channel": "소개",
+      "contracted": "미계약", "amount": 0, "note": "", "images": []
+    }
+  ],
+  "nextNoticeId": 2,
+  "notices": [
+    {
+      "id": 1, "date": "2026-01-15", "company": "(샘플) 가나다산업", "manager": "홍길동",
+      "contact": "010-0000-0000", "email": "sample1@example.com",
+      "programs": ["수출바우처"], "note": "공고 안내 대상 샘플"
+    }
+  ],
+  "companies": []
+}

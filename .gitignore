@@ -1,0 +1,14 @@
+# 고객 개인정보 — 절대 커밋 금지
+data.json
+data.backup.json
+uploads/
+
+# 비밀번호
+admin.config.json
+
+# 전달용 문서(비밀번호 표기 포함) / 대용량 바이너리
+사용안내.txt
+인터넷공유_안내.txt
+인터넷공유_실행.bat
+cloudflared.exe
+*.zip

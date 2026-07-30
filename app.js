@@ -12,8 +12,8 @@
   var workspace = "gov"; // "gov"=정부지원사업, "gen"=일반고객
   // 워크스페이스별 필터/상태를 따로 보관 (분류값이 서로 달라 전환 시 섞이지 않도록)
   var cFilters = {
-    gov: { cat: "__all", contract: "__all", q: "", year: "__all", month: "__all" },
-    gen: { cat: "__all", contract: "__all", q: "", year: "__all", month: "__all" }
+    gov: { cat: "__all", contract: "__all", owner: "__all", q: "", year: "__all", month: "__all" },
+    gen: { cat: "__all", contract: "__all", owner: "__all", q: "", year: "__all", month: "__all" }
   };
   var nFilter = { program: "__all", year: "__all", month: "__all" };
   var statsYears = { gov: null, gen: null };
@@ -98,7 +98,12 @@
   function won(n) { n = Number(n) || 0; return n.toLocaleString("ko-KR") + "원"; }
   function programs() { return (DATA && DATA.meta && DATA.meta.programs) || []; }
   function cats() { return ws().cats; }
-  function markDirty() { dirty = true; var m = $("saveMsg"); m.className = "msg dirty"; m.textContent = "● 저장하지 않은 변경사항이 있습니다"; }
+  function markDirty() {
+    dirty = true;
+    var m = $("saveMsg"); m.className = "msg dirty";
+    m.textContent = LIVE ? "● 저장하지 않은 변경이 있습니다 — ‘저장하기’를 눌러주세요"
+                         : "● 저장하지 않은 변경사항이 있습니다";
+  }
   function clearDirty(msg) { dirty = false; var m = $("saveMsg"); m.className = "msg ok"; m.textContent = msg || ""; }
 
   function api(path, method, body) {
@@ -107,6 +112,367 @@
       headers: { "X-Admin-Token": TOKEN, "Content-Type": "application/json" },
       body: body != null ? body : undefined
     }).then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); });
+  }
+
+  // ==================================================================
+  //  실시간 공동편집 (serve.ps1 로 띄운 서버 모드에서만 동작)
+  //
+  //  왜 필요한가: 예전 방식은 "저장하기"를 누르면 내 브라우저가 들고 있는 전체
+  //  데이터를 파일에 통째로 덮어썼다. 두 사람이 각자 1건씩 추가한 뒤 차례로
+  //  저장하면 먼저 저장한 사람의 건이 사라진다.
+  //
+  //  바뀐 방식:
+  //   · 칸 하나를 고치면 "그 칸의 변경"(op) 만 서버에 보낸다 → 서로 안 겹친다
+  //   · 3초마다 남이 바꾼 op 를 받아 화면에 반영한다
+  //   · 새 줄의 번호(id)는 서버가 발급한다 → 같은 번호를 쓰는 일이 없다
+  //   · 엑셀 대량등록·유지보수 시트처럼 큰 변경만 전체 저장을 쓰고, 그 사이
+  //     남이 바꿨으면 서버가 거절(409)하므로 최신 내용을 받아 합친 뒤 다시 보낸다
+  // ==================================================================
+  var LIVE = false;                              // 실시간 동기화 사용 중인가
+  var REV = 0;                                   // 내가 반영을 마친 서버 시점
+  var ME = localStorage.getItem("govStaff") || ""; // 로그인한 직원 이름
+  var CID = Math.random().toString(36).slice(2) + "-" + Date.now().toString(36); // 이 브라우저 식별자
+  var outbox = [];        // 아직 서버로 보내지 못한 변경
+  var sendTimer = null;
+  var sending = false;
+  var polling = false;
+  var pollTimer = null;
+  var editing = null;     // 지금 커서가 놓인 칸 (남의 변경이 덮어쓰지 못하게 보호)
+  var offline = false;
+
+  function setStatus(cls, text) {
+    var m = $("saveMsg"); if (!m) return;
+    m.className = "msg " + (cls || "");
+    m.textContent = text || "";
+  }
+  // 평상시 표시 (변경 없음 = 실시간 저장 중)
+  function liveIdle() {
+    if (!LIVE) return;
+    if (offline) { setStatus("err", "서버와 연결이 끊겼습니다 — 다시 연결 중…"); return; }
+    if (dirty) { setStatus("dirty", "● 저장하지 않은 변경이 있습니다 — ‘저장하기’를 눌러주세요"); return; }
+    setStatus("ok", "🟢 실시간 저장 중" + (ME ? " · " + ME : ""));
+  }
+
+  // ---------- 어느 칸을 편집 중인지 ----------
+  function fieldKeyOf(t) {
+    if (!t || !t.getAttribute || !t.closest) return null;
+    var cfk = t.getAttribute("data-cf");
+    if (cfk) return { coll: ws().list, id: contractId, f: cfk, c: true };
+    var f = t.getAttribute("data-f");
+    if (!f) return null;
+    var tr = t.closest("tr[data-id]");
+    if (!tr) return null;
+    return { coll: t.closest("#tab-notices") ? "notices" : ws().list,
+      id: Number(tr.getAttribute("data-id")), f: f };
+  }
+  // 화면을 다시 그리면 입력칸이 새로 만들어져 focusout 기록이 어긋날 수 있으므로,
+  // 지금 실제로 커서가 있는 칸을 DOM 에서 직접 확인한다(기록은 보조로만 쓴다).
+  function activeKey() { return fieldKeyOf(document.activeElement) || editing; }
+  function isEditing(coll, id, f, inContract) {
+    var k = activeKey();
+    return !!(k && k.coll === coll && k.id === id && k.f === f && !!k.c === !!inContract);
+  }
+
+  // ---------- 변경 보내기 ----------
+  // 같은 줄의 연속된 수정은 하나로 합쳐 보낸다(타이핑 1글자마다 요청하지 않도록)
+  function pushOp(op) {
+    if (!LIVE) { markDirty(); return; }
+    var last = outbox[outbox.length - 1];
+    if (last && (op.t === "set" || op.t === "cset") && last.t === op.t &&
+        last.coll === op.coll && last.id === op.id) {
+      for (var k in op.f) last.f[k] = op.f[k];
+    } else {
+      outbox.push(op);
+    }
+    setStatus("dirty", "저장 중…");
+    if (sendTimer) clearTimeout(sendTimer);
+    sendTimer = setTimeout(function () { flushOps(); }, 500);
+  }
+
+  function flushOps(cb) {
+    if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
+    if (!LIVE || !outbox.length) { if (cb) cb(); return; }
+    if (sending) { sendTimer = setTimeout(function () { flushOps(cb); }, 300); return; }
+    var batch = outbox; outbox = [];
+    sending = true;
+    fetch("/api/patch", {
+      method: "POST",
+      headers: {
+        "X-Admin-Token": TOKEN, "Content-Type": "application/json",
+        "X-User": encodeURIComponent(ME || ""), "X-Client": CID
+      },
+      body: JSON.stringify(batch)
+    }).then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); })
+      .then(function (res) {
+        sending = false;
+        if (res.status === 401) { logout(); return; }
+        if (res.status !== 200 || !res.j || !res.j.ok) throw new Error("save");
+        // REV 은 여기서 올리지 않는다. 내 변경이 기록된 시점과 내가 마지막으로 받아본
+        // 시점 사이에 남의 변경이 끼어 있을 수 있어, 건너뛰면 그 변경을 영구히 놓친다.
+        // 다음 /api/changes 에서 남의 것만 반영하고 내 것은 cid 로 걸러진다.
+        offline = false;
+        if (!outbox.length && !dirty) {
+          setStatus("ok", "✓ 자동 저장됨 " + new Date().toLocaleTimeString("ko-KR"));
+        }
+        if (cb) cb();
+      })
+      .catch(function () {
+        sending = false; offline = true;
+        outbox = batch.concat(outbox);   // 버리지 않고 다시 시도
+        setStatus("err", "저장 실패 — 연결 확인 중입니다. 자동으로 다시 시도합니다.");
+        sendTimer = setTimeout(function () { flushOps(cb); }, 4000);
+      });
+  }
+
+  // ---------- 남의 변경 받아 반영하기 ----------
+  function findIn(coll, id) {
+    var L = DATA && DATA[coll]; if (!L) return null;
+    for (var i = 0; i < L.length; i++) if (L[i].id === id) return L[i];
+    return null;
+  }
+  function applyOp(o) {
+    if (!o || !o.t || !DATA) return;
+    if (o.t === "set" || o.t === "cset") {
+      var r = findIn(o.coll, o.id); if (!r) return;
+      var tgt = r;
+      if (o.t === "cset") { r.contract = r.contract || {}; tgt = r.contract; }
+      for (var k in o.f) {
+        if (isEditing(o.coll, o.id, k, o.t === "cset")) continue; // 내가 타이핑 중인 칸은 보호
+        tgt[k] = o.f[k];
+      }
+      return;
+    }
+    if (o.t === "add") {
+      var L = DATA[o.coll]; if (!L) return;
+      var rows = o.rows || (o.row ? [o.row] : []);
+      rows.forEach(function (row) {
+        if (!row || (row.id != null && findIn(o.coll, row.id))) return; // 중복 방지
+        if (o.top) L.unshift(row); else L.push(row);
+      });
+      return;
+    }
+    if (o.t === "del") {
+      var kill = {};
+      (o.ids || []).forEach(function (i) { kill[i] = true; });
+      DATA[o.coll] = (DATA[o.coll] || []).filter(function (x) { return !kill[x.id]; });
+      return;
+    }
+    if (o.t === "meta") {
+      DATA.meta = DATA.meta || {};
+      for (var k2 in o.f) DATA.meta[k2] = o.f[k2];
+      return;
+    }
+  }
+
+  function pullChanges(cb) {
+    if (!LIVE || !DATA || polling) { if (cb) cb(); return; }
+    polling = true;
+    api("/api/changes?since=" + REV, "GET").then(function (res) {
+      polling = false;
+      if (res.status === 401) { logout(); return; }
+      var j = res.j || {};
+      var wasOffline = offline; offline = false;
+      // 그 사이 서버가 스냅샷을 새로 만들어 변경기록이 정리됨 → 전체를 다시 받는다.
+      // 단, 내게 아직 저장하지 않은 변경이 있으면 다시 받으면 그게 사라지므로 알리고 멈춘다.
+      if (j.reload) {
+        if (dirty) {
+          setStatus("err", "다른 직원이 큰 변경을 저장했습니다. ‘저장하기’를 눌러 내 변경을 먼저 반영하세요.");
+        } else {
+          REV = Number(j.rev) || 0; loadData();
+        }
+        if (cb) cb(); return;
+      }
+      var lines = j.lines || [];
+      var touched = false;
+      lines.forEach(function (ln) {
+        if (!ln || Number(ln.rev) <= REV) return;
+        REV = Number(ln.rev);
+        if (ln.cid === CID) return;         // 내가 보낸 변경(이미 화면에 있다)
+        (ln.ops || []).forEach(applyOp);
+        touched = true;
+      });
+      if (Number(j.rev) > REV) REV = Number(j.rev);
+      if (touched) redrawKeepingPlace(lines);
+      else if (wasOffline) liveIdle();
+      if (cb) cb();
+    }).catch(function () {
+      polling = false; offline = true;
+      setStatus("err", "서버와 연결이 끊겼습니다 — 다시 연결 중…");
+      if (cb) cb();
+    });
+  }
+
+  // 화면을 새로 그리되 보고 있던 스크롤 위치와 입력 중이던 칸·커서는 유지한다
+  function redrawKeepingPlace(lines) {
+    var a = document.activeElement;
+    var key = fieldKeyOf(a);
+    var val = null, ss = null, se = null;
+    if (key) {
+      val = a.value;
+      try { ss = a.selectionStart; se = a.selectionEnd; } catch (e) {}
+    }
+    var sy = window.scrollY;
+    render();
+    var modal = $("contractModal");
+    if (contractId != null && modal && !modal.classList.contains("hidden")) {
+      var cc = findCust(contractId); if (cc) renderContractBody(cc);
+    }
+    if (key) {
+      var sel = key.c
+        ? '#cmBody [data-cf="' + key.f + '"]'
+        : (key.coll === "notices" ? "#tab-notices" : "#tab-customers") +
+          ' tr[data-id="' + key.id + '"] [data-f="' + key.f + '"]';
+      var e2 = document.querySelector(sel);
+      if (e2) {
+        if (val != null && e2.value !== val) {
+          e2.value = val;                       // 내가 입력 중이던 값을 화면에 살린다
+          // 데이터에도 되돌려 놓는다. 원격 변경이 스쳐 지나가도 내 입력이 사라지지 않게.
+          var row = findIn(key.coll, key.id);
+          if (row) {
+            if (key.c) { row.contract = row.contract || {}; row.contract[key.f] = val; }
+            else { row[key.f] = (key.f === "amount") ? (Number(val) || 0) : val; }
+          }
+        }
+        try { e2.focus(); if (ss != null && e2.setSelectionRange) e2.setSelectionRange(ss, se); } catch (e3) {}
+        editing = key;
+      }
+    }
+    window.scrollTo(0, sy);
+    var who = {};
+    (lines || []).forEach(function (ln) { if (ln && ln.cid !== CID && ln.by) who[ln.by] = 1; });
+    var names = Object.keys(who);
+    setStatus("ok", (names.length ? "↻ " + names.join(", ") + " 님의 변경을 반영했습니다" : "↻ 최신 내용으로 갱신했습니다") +
+      " " + new Date().toLocaleTimeString("ko-KR"));
+    setTimeout(liveIdle, 4000);
+  }
+
+  // ---------- 새 줄 번호 발급 (서버가 주므로 직원끼리 겹치지 않는다) ----------
+  function allocIds(key, n, cb) {
+    if (!LIVE) {
+      var s = Number(DATA[key]) || 1;
+      DATA[key] = s + n;
+      cb(s); return;
+    }
+    fetch("/api/newid", {
+      method: "POST",
+      headers: { "X-Admin-Token": TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ key: key, n: n })
+    }).then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || !j.ok) throw new Error("id");
+        var st = Number(j.start);
+        if (!(Number(DATA[key]) >= st + n)) DATA[key] = st + n;
+        cb(st);
+      })
+      .catch(function () { setStatus("err", "번호를 발급받지 못했습니다. 연결을 확인하세요."); });
+  }
+
+  // ---------- 전체 저장 (큰 변경 전용) ----------
+  function serverSave(retried, force) {
+    var btn = $("saveBtn"); if (btn) btn.disabled = true;
+    var headers = { "X-Admin-Token": TOKEN, "Content-Type": "application/json" };
+    if (LIVE && !force) headers["X-Rev"] = String(REV);   // force = 겹침을 사용자가 감수하고 강행
+    fetch("/api/save", { method: "POST", headers: headers, body: JSON.stringify(DATA) })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); })
+      .then(function (res) {
+        if (btn) btn.disabled = false;
+        if (res.status === 401) { logout(); return; }
+        // 내가 저장을 준비하는 사이 남이 바꿨다 → 그 변경을 먼저 받아 합친 뒤 다시 저장
+        if (res.status === 409 && res.j && res.j.stale) {
+          if (retried) {
+            setStatus("err", "다른 직원의 변경과 겹칩니다.");
+            if (confirm("다른 직원이 방금 저장한 내용과 겹칩니다.\n\n내 화면 기준으로 그대로 저장하면 그 사이 다른 직원이 바꾼 내용이 사라질 수 있습니다.\n(이전 파일은 backups 폴더에 남습니다)\n\n그대로 저장할까요?")) {
+              serverSave(true, true);
+            }
+            return;
+          }
+          setStatus("dirty", "다른 직원의 변경을 먼저 반영합니다…");
+          pullChanges(function () { serverSave(true); });
+          return;
+        }
+        if (res.status === 200 && res.j && res.j.ok) {
+          if (Number(res.j.rev) >= 0) REV = Number(res.j.rev);
+          dirty = false;
+          setStatus("ok", "✓ 저장되었습니다 (" + new Date().toLocaleTimeString("ko-KR") + ")");
+          if (LIVE) setTimeout(liveIdle, 3000);
+          return;
+        }
+        setStatus("err", "저장 실패: " + ((res.j && res.j.error) || res.status));
+      })
+      .catch(function () { if (btn) btn.disabled = false; setStatus("err", "저장 중 오류가 발생했습니다."); });
+  }
+
+  // ---------- 이름(접수자) ----------
+  // 직원 이름 목록 = 등록된 직원 + 나 + 표의 ‘접수자’ 칸에 이미 적혀 있는 이름.
+  // 엑셀로 올라온 이름도 필터·선택 상자에서 바로 고를 수 있어야 하므로 표를 훑는다.
+  // 4천 건 이상을 매 행마다 훑으면 느려지므로 한 번 만든 목록을 재사용한다.
+  var staffCache = null;
+  function invalidateStaff() { staffCache = null; }
+  function staffList() {
+    if (staffCache) return staffCache;
+    var seen = {}, out = [];
+    function add(n) {
+      n = String(n == null ? "" : n).trim();
+      if (n && !seen[n]) { seen[n] = 1; out.push(n); }
+    }
+    ((DATA && DATA.meta && DATA.meta.staff) || []).forEach(add);
+    add(ME);
+    ["customers", "genCustomers"].forEach(function (k) {
+      var arr = (DATA && DATA[k]) || [];
+      for (var i = 0; i < arr.length; i++) add(arr[i].owner);
+    });
+    staffCache = out;
+    return out;
+  }
+  function askName(canCancel) {
+    var box = $("nameModal");
+    if (!box) { box = el("div", { id: "nameModal", class: "modal" }); document.body.appendChild(box); }
+    var st = staffList();
+    var opts = st.map(function (s) {
+      return '<option value="' + esc(s) + '"' + (s === ME ? " selected" : "") + ">" + esc(s) + "</option>";
+    }).join("");
+    box.innerHTML =
+      '<div class="modal-card" style="width:420px">' +
+        '<div class="modal-head"><h2>👤 사용 직원 확인</h2></div>' +
+        '<div style="padding:20px 24px 24px">' +
+          '<div style="font-size:13px;color:var(--muted);line-height:1.65;margin-bottom:14px">' +
+            '누가 등록·수정했는지 기록하기 위해 이름을 정합니다.<br>' +
+            '이 브라우저에 기억되므로 다음 접속부터는 묻지 않습니다.</div>' +
+          (st.length ? '<select id="nmSel" style="width:100%;margin-bottom:8px"><option value="">— 등록된 이름에서 선택 —</option>' + opts + '</select>' : '') +
+          '<input type="text" id="nmNew" placeholder="새 이름 입력 (예: 홍길동)" style="width:100%">' +
+          '<div id="nmErr" class="msg err" style="font-size:12.5px;min-height:16px;margin:8px 0 0"></div>' +
+          '<div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">' +
+            (canCancel ? '<button class="btn ghost" id="nmCancel">취소</button>' : '') +
+            '<button class="btn" id="nmOk">시작하기</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    box.classList.remove("hidden");
+    var pick = function () {
+      var v = (($("nmNew").value || "").trim()) || ($("nmSel") ? $("nmSel").value : "");
+      v = String(v).trim();
+      if (!v) { $("nmErr").textContent = "이름을 선택하거나 입력하세요."; return; }
+      box.classList.add("hidden");
+      setMe(v);
+    };
+    $("nmOk").onclick = pick;
+    $("nmNew").onkeydown = function (e) { if (e.key === "Enter") pick(); };
+    if ($("nmSel")) $("nmSel").onchange = function () { if (this.value) $("nmNew").value = ""; };
+    if (canCancel && $("nmCancel")) $("nmCancel").onclick = function () { box.classList.add("hidden"); };
+    setTimeout(function () { var n = $("nmNew"); if (n && !st.length) n.focus(); }, 30);
+  }
+  function setMe(v) {
+    ME = v;
+    try { localStorage.setItem("govStaff", v); } catch (e) {}
+    var st = (DATA.meta.staff || []).slice();
+    if (st.indexOf(v) < 0) {
+      st.push(v); st.sort();
+      DATA.meta.staff = st;
+      pushOp({ t: "meta", f: { staff: st } });
+    }
+    invalidateStaff();
+    liveIdle();
+    render();
   }
 
   // ===== 정적 모드 (serve.ps1 없이 GitHub Pages 등에서 열린 경우) =====
@@ -305,10 +671,19 @@
       }
       return;
     }
-    api("/api/data", "GET").then(function (res) {
-      if (res.status === 401) { logout(); return; }
-      applyData(res.j || {});
-    });
+    // X-Rev = 이 스냅샷이 담고 있는 시점. 그 뒤의 변경은 곧바로 /api/changes 로 이어받는다
+    fetch("/api/data", { headers: { "X-Admin-Token": TOKEN } })
+      .then(function (r) {
+        if (r.status === 401) { logout(); return null; }
+        var rv = Number(r.headers.get("X-Rev"));
+        return r.json().then(function (j) { REV = isNaN(rv) ? 0 : rv; return j; });
+      })
+      .then(function (j) {
+        if (!j) return;
+        applyData(j);
+        if (LIVE) pullChanges();
+      })
+      .catch(function () { setStatus("err", "데이터를 불러오지 못했습니다. 연결을 확인하세요."); });
   }
 
   function applyStaticText() {
@@ -329,9 +704,15 @@
     DATA.nextGenId = DATA.nextGenId || 1;
     DATA.nextNoticeId = DATA.nextNoticeId || 1;
     DATA.companies = DATA.companies || [];
+    DATA.meta.staff = DATA.meta.staff || [];
     if (!mntSelId && DATA.companies.length) mntSelId = DATA.companies[0].id;
+    invalidateStaff();
     clearDirty("");
     render();
+    if (LIVE) {
+      if (!ME) askName(false);      // 처음 접속한 직원은 이름을 정하고 시작
+      else liveIdle();
+    }
   }
 
   function logout() {
@@ -342,18 +723,22 @@
       staticErr("");
       return;
     }
+    flushOps();                                     // 보내지 못한 변경을 먼저 넘긴다
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     sessionStorage.removeItem("govToken"); TOKEN = "";
     $("app").classList.add("hidden"); $("login").classList.remove("hidden");
   }
 
   function save() {
     if (STATIC) { staticSave(); return; }
-    var btn = $("saveBtn"); btn.disabled = true;
-    api("/api/save", "POST", JSON.stringify(DATA)).then(function (res) {
-      btn.disabled = false;
-      if (res.status === 200 && res.j.ok) { clearDirty("✓ 저장되었습니다 (" + new Date().toLocaleTimeString("ko-KR") + ")"); }
-      else { var m = $("saveMsg"); m.className = "msg err"; m.textContent = "저장 실패: " + (res.j.error || res.status); }
-    }).catch(function () { btn.disabled = false; var m = $("saveMsg"); m.className = "msg err"; m.textContent = "저장 중 오류가 발생했습니다."; });
+    if (!LIVE) { serverSave(false); return; }
+    // 실시간 모드에서는 칸 수정이 이미 자동 저장되어 있다.
+    // 남은 변경(엑셀 대량등록·유지보수 시트 등)만 전체 저장으로 마무리한다.
+    flushOps(function () {
+      if (dirty) { serverSave(false); return; }
+      setStatus("ok", "✓ 모든 변경이 이미 저장되어 있습니다");
+      setTimeout(liveIdle, 2500);
+    });
   }
 
   // ---------- 탭 전환 ----------
@@ -396,6 +781,8 @@
     return curList().filter(function (c) {
       if (f.cat !== "__all" && c[catField] !== f.cat) return false;
       if (f.contract !== "__all" && c.contracted !== f.contract) return false;
+      if (f.owner === "__none") { if (c.owner) return false; }
+      else if (f.owner !== "__all" && (c.owner || "") !== f.owner) return false;
       if (f.year !== "__all" && String(c.date).slice(0, 4) !== f.year) return false;
       if (f.month !== "__all" && String(parseInt(String(c.date).slice(5, 7), 10) || 0) !== f.month) return false;
       if (q) {
@@ -425,11 +812,14 @@
 
   function refreshWho() {
     $("whoCount").textContent = ws().noun + " " + curList().length + "건 · 알림대상 " + DATA.notices.length + "곳";
+    var b = $("meBtn");
+    if (b) b.textContent = "👤 " + (ME || "이름 설정");
   }
 
   function renderCustomers() {
     var host = $("tab-customers");
     host.innerHTML = "";
+    invalidateStaff();
     refreshWho();
 
     // 분류(기고객/신규고객·지원사업) 하위 탭
@@ -437,20 +827,9 @@
 
     // 현재 필터가 적용된 목록 기준 통계 카드
     var rows = filteredCustomers();
-    var nContract = rows.filter(function (c) { return c.contracted === "계약"; }).length;
-    var nDoing = rows.filter(function (c) { return c.contracted === "진행중"; }).length;
-    var sales = rows.reduce(function (s, c) { return s + (c.contracted === "계약" ? (Number(c.amount) || 0) : 0); }, 0);
     var f = cf();
-    var scope =
-      (f.year === "__all" ? "전체 연도" : f.year + "년") +
-      (f.month === "__all" ? "" : " " + f.month + "월");
-
     var stats = el("div", { class: "stats" });
-    stats.innerHTML =
-      '<div class="stat total"><div class="n">' + rows.length + '</div><div class="l">' + esc(scope) + ' 문의</div></div>' +
-      '<div class="stat done"><div class="n">' + nContract + '</div><div class="l">계약 완료</div></div>' +
-      '<div class="stat doing"><div class="n">' + nDoing + '</div><div class="l">진행중</div></div>' +
-      '<div class="stat sales"><div class="n">' + won(sales) + '</div><div class="l">계약 매출 합계</div></div>';
+    stats.innerHTML = custStatsHtml(rows);
     host.appendChild(stats);
 
     // 툴바
@@ -460,10 +839,14 @@
     var yearOpts = '<option value="__all">전체 연도</option>' + yearsList.map(function (y) { return '<option value="' + y + '"' + (f.year === y ? " selected" : "") + ">" + y + "년</option>"; }).join("");
     var monthOpts = '<option value="__all">전체 월</option>';
     for (var mi = 1; mi <= 12; mi++) { monthOpts += '<option value="' + mi + '"' + (f.month === String(mi) ? " selected" : "") + ">" + mi + "월</option>"; }
+    var ownerFilterOpts = '<option value="__all">전체 접수자</option>' +
+      staffList().map(function (s) { return '<option value="' + esc(s) + '"' + (f.owner === s ? " selected" : "") + ">" + esc(s) + "</option>"; }).join("") +
+      '<option value="__none"' + (f.owner === "__none" ? " selected" : "") + '>(접수자 없음)</option>';
     tb.innerHTML =
       '<select id="fYear">' + yearOpts + '</select>' +
       '<select id="fMonth">' + monthOpts + '</select>' +
       '<select id="fContract">' + contOpts + '</select>' +
+      '<select id="fOwner">' + ownerFilterOpts + '</select>' +
       '<input type="text" id="fQ" placeholder="업체명·담당자·내용 검색" value="' + esc(f.q) + '">' +
       '<span class="sp"></span>' +
       '<button class="btn ghost tiny" id="tplCust">⬇ 양식</button>' +
@@ -497,7 +880,7 @@
       table.innerHTML = "<thead><tr>" +
         '<th class="selcol"><input type="checkbox" id="selAll" title="이 페이지 전체선택"></th>' +
         "<th>번호</th><th>날짜</th><th>업체명</th><th>담당자</th><th>연락처</th>" +
-        "<th>이메일</th><th>문의내용</th><th>문의경로</th><th>계약여부</th><th>견적금액</th><th>비고</th><th>계약내용</th><th></th>" +
+        "<th>이메일</th><th>문의내용</th><th>문의경로</th><th>계약여부</th><th>견적금액</th><th>비고</th><th>접수자</th><th>계약내용</th><th></th>" +
         "</tr></thead>";
       var tbody = el("tbody");
       var catField = ws().catField;
@@ -509,6 +892,12 @@
         var chanOpts = CHANNELS.map(function (v) { return '<option value="' + esc(v) + '"' + (c.channel === v ? " selected" : "") + ">" + esc(v) + "</option>"; }).join("");
         var contOptsRow = CONTRACT.map(function (v) { return '<option value="' + esc(v) + '"' + (c.contracted === v ? " selected" : "") + ">" + esc(v) + "</option>"; }).join("");
         var catTag = (cf().cat === "__all" && c[catField]) ? '<span class="cattag">' + esc(c[catField]) + '</span> ' : "";
+        var ownerNames = staffList();
+        // 엑셀로 들어온 이름 등 직원 목록에 없는 값도 그대로 보이도록 넣어 준다
+        if (c.owner && ownerNames.indexOf(c.owner) < 0) ownerNames = ownerNames.concat([c.owner]);
+        var ownerOpts = '<option value="">-</option>' + ownerNames.map(function (v) {
+          return '<option value="' + esc(v) + '"' + ((c.owner || "") === v ? " selected" : "") + ">" + esc(v) + "</option>";
+        }).join("");
         tr.innerHTML =
           '<td class="selcol"><input type="checkbox" class="rowsel"' + (picked ? " checked" : "") + '></td>' +
           '<td class="no">' + (start + i + 1) + '</td>' +
@@ -522,6 +911,7 @@
           '<td><select class="contract" data-f="contracted">' + contOptsRow + '</select></td>' +
           '<td class="amt"><input type="number" data-f="amount" value="' + (Number(c.amount) || 0) + '" min="0" step="10000" style="min-width:110px"></td>' +
           '<td><input type="text" data-f="note" value="' + esc(c.note) + '" style="min-width:90px"></td>' +
+          '<td><select data-f="owner" style="min-width:78px">' + ownerOpts + '</select></td>' +
           '<td class="ccell">' + (c.contracted === "계약"
             ? '<button class="btn tiny contractbtn" title="계약 작업 착수 정보">📄 계약내용' + (hasContractData(c) ? " ✓" : "") + '</button>'
             : '<span style="color:var(--muted);font-size:11px">-</span>') + '</td>' +
@@ -560,6 +950,7 @@
     $("fYear").onchange = function () { cf().year = this.value; resetCustPage(); renderCustomers(); };
     $("fMonth").onchange = function () { cf().month = this.value; resetCustPage(); renderCustomers(); };
     $("fContract").onchange = function () { cf().contract = this.value; resetCustPage(); renderCustomers(); };
+    $("fOwner").onchange = function () { cf().owner = this.value; resetCustPage(); renderCustomers(); };
     $("fQ").oninput = function () { cf().q = this.value; };
     $("fQ").onkeydown = function (e) { if (e.key === "Enter") { resetCustPage(); renderCustomers(); } };
     $("fQ").onblur = function () { resetCustPage(); renderCustomers(); };
@@ -587,9 +978,11 @@
     $("delSel").onclick = function () {
       var ids = selIds();
       if (!ids.length) return;
-      if (!confirm(ids.length.toLocaleString("ko-KR") + "건의 문의를 삭제할까요?\n\n(상단 “저장하기”를 눌러야 최종 반영됩니다)")) return;
+      if (!confirm(ids.length.toLocaleString("ko-KR") + "건의 문의를 삭제할까요?" +
+        (LIVE ? "\n\n삭제는 즉시 저장되며 되돌릴 수 없습니다." : "\n\n(상단 “저장하기”를 눌러야 최종 반영됩니다)"))) return;
+      var coll = ws().list;
       deleteCustomers(ids);
-      markDirty();
+      pushOp({ t: "del", coll: coll, ids: ids });
       renderCustomers();
     };
     refreshSelUI();
@@ -601,9 +994,13 @@
         var ev = (inp.tagName === "SELECT") ? "change" : "input";
         inp.addEventListener(ev, function () {
           var c = findCust(id); if (!c) return;
-          c[f] = (f === "amount") ? (Number(inp.value) || 0) : inp.value;
-          markDirty();
-          if (f === "contracted" || f === "amount") refreshCustStats();
+          var v = (f === "amount") ? (Number(inp.value) || 0) : inp.value;
+          c[f] = v;
+          var patch = {}; patch[f] = v;
+          pushOp({ t: "set", coll: ws().list, id: id, f: patch });
+          // 계약여부는 ‘계약내용’ 칸까지 달라지므로 표를 다시 그린다(선택 상자라 커서 문제 없음)
+          if (f === "contracted") { renderCustomers(); return; }
+          if (f === "amount") refreshCustStats();
         });
       });
       var cbtn = tr.querySelector(".contractbtn");
@@ -614,7 +1011,8 @@
         b.addEventListener("click", function () {
           var c = findCust(id); if (!c || !c.images) return;
           c.images.splice(Number(b.getAttribute("data-imgdel")), 1);
-          markDirty(); renderCustomers();
+          pushOp({ t: "set", coll: ws().list, id: id, f: { images: c.images.slice() } });
+          renderCustomers();
         });
       });
       var scb = tr.querySelector(".rowsel");
@@ -622,9 +1020,11 @@
       tr.querySelector(".rowdel").onclick = function () {
         var c = findCust(id);
         var nm = (c && c.company) ? c.company : "선택한";
-        if (!confirm('“' + nm + '” 문의를 삭제할까요?\n\n(상단 “저장하기”를 눌러야 최종 반영됩니다)')) return;
+        if (!confirm('“' + nm + '” 문의를 삭제할까요?' + (LIVE ? "\n\n삭제는 즉시 저장되며 되돌릴 수 없습니다." : "\n\n(상단 “저장하기”를 눌러야 최종 반영됩니다)"))) return;
+        var coll = ws().list;
         deleteCustomers([id]);
-        markDirty(); renderCustomers();
+        pushOp({ t: "del", coll: coll, ids: [id] });
+        renderCustomers();
       };
     });
   }
@@ -705,7 +1105,8 @@
         anyErr = f.name + ": 10MB를 초과합니다."; if (--remaining === 0) finishImg(anyErr); return;
       }
       uploadImage(f, function (err, src) {
-        if (err) anyErr = err.message; else { c.images.push(src); markDirty(); }
+        if (err) anyErr = err.message;
+        else { c.images.push(src); pushOp({ t: "set", coll: ws().list, id: id, f: { images: c.images.slice() } }); }
         if (--remaining === 0) finishImg(anyErr);
       });
     });
@@ -794,7 +1195,10 @@
     body.querySelectorAll("[data-cf]").forEach(function (inp) {
       inp.addEventListener("input", function () {
         var cc = findCust(contractId); if (!cc) return; ensureContract(cc);
-        cc.contract[inp.getAttribute("data-cf")] = inp.value; markDirty();
+        var k = inp.getAttribute("data-cf");
+        cc.contract[k] = inp.value;
+        var patch = {}; patch[k] = inp.value;
+        pushOp({ t: "cset", coll: ws().list, id: contractId, f: patch });
       });
     });
     body.querySelectorAll("[data-fladd]").forEach(function (lbl) {
@@ -806,11 +1210,16 @@
       b.addEventListener("click", function () {
         var parts = b.getAttribute("data-fdel").split(":"); var key = parts[0], idx = Number(parts[1]);
         var cc = findCust(contractId); if (!cc || !cc.contract) return;
-        cc.contract[key].splice(idx, 1); markDirty(); renderContractBody(cc);
+        cc.contract[key].splice(idx, 1);
+        var p = {}; p[key] = cc.contract[key].slice();
+        pushOp({ t: "cset", coll: ws().list, id: contractId, f: p });
+        renderContractBody(cc);
       });
     });
     $("cmCloseBtn").onclick = closeContract;
-    $("cmSaveBtn").onclick = function () { save(); };
+    var sbtn = $("cmSaveBtn");
+    if (LIVE) { sbtn.textContent = "확인 (자동 저장됨)"; sbtn.onclick = closeContract; }
+    else { sbtn.onclick = function () { save(); }; }
   }
 
   function uploadFile(file, cb) {
@@ -841,7 +1250,12 @@
     files.forEach(function (f) {
       if (f.size > 50 * 1024 * 1024) { anyErr = f.name + ": 50MB를 초과합니다."; if (--remaining === 0) finishFile(anyErr); return; }
       uploadFile(f, function (err, res) {
-        if (err) anyErr = err.message; else { c.contract[key].push({ name: res.name, file: res.file }); markDirty(); }
+        if (err) anyErr = err.message;
+        else {
+          c.contract[key].push({ name: res.name, file: res.file });
+          var p = {}; p[key] = c.contract[key].slice();
+          pushOp({ t: "cset", coll: ws().list, id: id, f: p });
+        }
         if (--remaining === 0) finishFile(anyErr);
       });
     });
@@ -856,9 +1270,24 @@
     if (curTab === "customers") renderCustomers();
   }
 
+  function custStatsHtml(rows) {
+    var nContract = rows.filter(function (c) { return c.contracted === "계약"; }).length;
+    var nDoing = rows.filter(function (c) { return c.contracted === "진행중"; }).length;
+    var sales = rows.reduce(function (s, c) { return s + (c.contracted === "계약" ? (Number(c.amount) || 0) : 0); }, 0);
+    var f = cf();
+    var scope = (f.year === "__all" ? "전체 연도" : f.year + "년") +
+      (f.month === "__all" ? "" : " " + f.month + "월");
+    return '<div class="stat total"><div class="n">' + rows.length + '</div><div class="l">' + esc(scope) + ' 문의</div></div>' +
+      '<div class="stat done"><div class="n">' + nContract + '</div><div class="l">계약 완료</div></div>' +
+      '<div class="stat doing"><div class="n">' + nDoing + '</div><div class="l">진행중</div></div>' +
+      '<div class="stat sales"><div class="n">' + won(sales) + '</div><div class="l">계약 매출 합계</div></div>';
+  }
+  // 금액을 입력하는 중에는 표 전체를 다시 그리면 커서가 튄다 → 통계 카드만 갱신
   function refreshCustStats() {
-    // 통계 카드만 다시 그리기 위해 전체 재렌더 (간단·안전)
-    if (curTab === "customers") renderCustomers();
+    if (curTab !== "customers") return;
+    var box = document.querySelector("#tab-customers .stats");
+    if (box) box.innerHTML = custStatsHtml(filteredCustomers());
+    else renderCustomers();
   }
   function findCust(id) { var L = curList(); for (var i = 0; i < L.length; i++) if (L[i].id === id) return L[i]; return null; }
   function customerYears() {
@@ -879,16 +1308,23 @@
       d = y + "-" + String(m).padStart(2, "0") + "-01";
     }
     var newContract = (f.contract !== "__all") ? f.contract : "미계약";
-    var row = {
-      id: DATA[cfg.nextIdKey]++, date: d, company: "", manager: "",
-      contact: "", email: "", inquiry: "", channel: "홈페이지", contracted: newContract, amount: 0, note: "", images: []
-    };
-    row[cfg.catField] = catVal;
-    curList().unshift(row);
-    resetCustPage();
-    markDirty(); renderCustomers();
-    var first = $("tab-customers").querySelector('tbody tr input[data-f="company"]');
-    if (first) first.focus();
+    var owner = (f.owner !== "__all" && f.owner !== "__none") ? f.owner : ME;
+    var coll = cfg.list;
+    // 번호는 서버가 발급한다 → 두 직원이 동시에 추가해도 같은 번호가 나오지 않는다
+    allocIds(cfg.nextIdKey, 1, function (newId) {
+      var row = {
+        id: newId, date: d, company: "", manager: "",
+        contact: "", email: "", inquiry: "", channel: "홈페이지", contracted: newContract,
+        amount: 0, note: "", owner: owner || "", images: []
+      };
+      row[cfg.catField] = catVal;
+      DATA[coll].unshift(row);
+      pushOp({ t: "add", coll: coll, top: true, rows: [row] });
+      resetCustPage();
+      renderCustomers();
+      var first = $("tab-customers").querySelector('tbody tr input[data-f="company"]');
+      if (first) first.focus();
+    });
   }
 
   // ===== 문의·매출 통계 =====
@@ -903,13 +1339,20 @@
     var dated = curList().filter(function (c) { return c.date; });
 
     // 연도별 집계 (전체 문의 기준, 계약/매출은 부가 지표)
-    var byYear = {}; // year -> {inq, contract, sum, months:{1..12:{inq,contract,sum}}, prog:{}}
+    var byYear = {}; // year -> {inq, contract, sum, months:{1..12:{inq,contract,sum}}, prog:{}, own:{}}
+    var ownAll = {};      // 접수자 -> {inq, contract, sum}  (연도 무관 전체)
+    var ownAnyNamed = false; // 접수자가 한 명이라도 적혀 있는가
+    function bump(bag, key, isC, amt) {
+      var o = bag[key] = bag[key] || { inq: 0, contract: 0, sum: 0 };
+      o.inq++;
+      if (isC) { o.contract++; o.sum += amt; }
+    }
     dated.forEach(function (c) {
       var y = String(c.date).slice(0, 4);
       var m = parseInt(String(c.date).slice(5, 7), 10) || 0;
       var isC = c.contracted === "계약";
       var amt = Number(c.amount) || 0;
-      if (!byYear[y]) { byYear[y] = { inq: 0, contract: 0, sum: 0, months: {}, prog: {} }; }
+      if (!byYear[y]) { byYear[y] = { inq: 0, contract: 0, sum: 0, months: {}, prog: {}, own: {} }; }
       byYear[y].inq++;
       if (isC) { byYear[y].contract++; byYear[y].sum += amt; byYear[y].prog[c[catField]] = (byYear[y].prog[c[catField]] || 0) + amt; }
       if (m) {
@@ -917,6 +1360,10 @@
         mo.inq++;
         if (isC) { mo.contract++; mo.sum += amt; }
       }
+      var ow = String(c.owner || "").trim();
+      if (ow) ownAnyNamed = true; else ow = "(미지정)";
+      bump(ownAll, ow, isC, amt);
+      bump(byYear[y].own, ow, isC, amt);
     });
     var years = Object.keys(byYear).sort();
     var sy = statsYears[workspace];
@@ -980,6 +1427,40 @@
     grid.appendChild(mc);
 
     host.appendChild(grid);
+
+    // 접수자별 집계 — 누가 몇 건을 받아 몇 건을 계약했는지. 접수자가 비어 있으면 표시하지 않는다.
+    if (ownAnyNamed) {
+      var oc = el("div", { class: "card", style: "margin-top:14px" });
+      var okeys = Object.keys(ownAll).sort(function (a, b) {
+        if (a === "(미지정)") return 1;
+        if (b === "(미지정)") return -1;
+        return ownAll[b].inq - ownAll[a].inq;
+      });
+      var ohtml = '<h2>접수자별 문의·계약 <span style="font-weight:500;color:var(--muted);font-size:12px">(문의·계약 관리 시트의 ‘접수자’ 칸 기준)</span></h2>' +
+        '<table class="sum"><thead><tr><th>접수자</th>' +
+        '<th class="r">문의</th><th class="r">계약</th><th class="r">계약률</th><th class="r">매출 합계</th>' +
+        '<th class="r">' + sy + '년 문의</th><th class="r">' + sy + '년 계약</th><th class="r">' + sy + '년 매출</th>' +
+        '</tr></thead><tbody>';
+      okeys.forEach(function (k) {
+        var a = ownAll[k];
+        var b = byYear[sy].own[k] || { inq: 0, contract: 0, sum: 0 };
+        var rate = a.inq ? Math.round(a.contract / a.inq * 100) : 0;
+        ohtml += '<tr><td><b>' + esc(k) + '</b></td>' +
+          '<td class="r">' + a.inq + '건</td><td class="r">' + a.contract + '건</td>' +
+          '<td class="r">' + rate + '%</td><td class="r">' + won(a.sum) + '</td>' +
+          '<td class="r">' + (b.inq ? b.inq + "건" : "-") + '</td><td class="r">' + (b.contract ? b.contract + "건" : "-") + '</td>' +
+          '<td class="r">' + (b.sum ? won(b.sum) : "-") + '</td></tr>';
+      });
+      var yb = byYear[sy];
+      ohtml += '<tr class="tot"><td>합계</td>' +
+        '<td class="r">' + totalInq + '건</td><td class="r">' + totalContract + '건</td>' +
+        '<td class="r">' + (totalInq ? Math.round(totalContract / totalInq * 100) : 0) + '%</td>' +
+        '<td class="r">' + won(totalSum) + '</td>' +
+        '<td class="r">' + yb.inq + '건</td><td class="r">' + yb.contract + '건</td><td class="r">' + won(yb.sum) + '</td></tr>';
+      ohtml += '</tbody></table>';
+      oc.innerHTML = ohtml;
+      host.appendChild(oc);
+    }
 
     host.querySelectorAll(".yrow").forEach(function (r) {
       r.onclick = function () { statsYears[workspace] = this.getAttribute("data-y"); renderStats(); };
@@ -1075,10 +1556,14 @@
       var m = (nFilter.month !== "__all") ? nFilter.month : String(now.getMonth() + 1);
       var d = (nFilter.year !== "__all" || nFilter.month !== "__all") ? (y + "-" + String(m).padStart(2, "0") + "-01") : today();
       var progs = (nFilter.program !== "__all") ? [nFilter.program] : [];
-      DATA.notices.push({ id: DATA.nextNoticeId++, date: d, company: "", manager: "", contact: "", email: "", programs: progs, note: "" });
-      markDirty(); renderNotices();
-      var last = host.querySelectorAll('tbody tr input[data-f="company"]');
-      if (last.length) last[last.length - 1].focus();
+      allocIds("nextNoticeId", 1, function (newId) {
+        var row = { id: newId, date: d, company: "", manager: "", contact: "", email: "", programs: progs, note: "" };
+        DATA.notices.push(row);
+        pushOp({ t: "add", coll: "notices", rows: [row] });
+        renderNotices();
+        var last = host.querySelectorAll('tbody tr input[data-f="company"]');
+        if (last.length) last[last.length - 1].focus();
+      });
     };
     $("copyEmails").onclick = function () {
       var list = filteredNotices().map(function (n) { return (n.email || "").trim(); }).filter(Boolean);
@@ -1095,7 +1580,13 @@
     wrap.querySelectorAll("tbody tr").forEach(function (tr) {
       var id = Number(tr.getAttribute("data-id"));
       tr.querySelectorAll("[data-f]").forEach(function (inp) {
-        inp.addEventListener("input", function () { var n = findNotice(id); if (n) { n[inp.getAttribute("data-f")] = inp.value; markDirty(); } });
+        inp.addEventListener("input", function () {
+          var n = findNotice(id); if (!n) return;
+          var k = inp.getAttribute("data-f");
+          n[k] = inp.value;
+          var p2 = {}; p2[k] = inp.value;
+          pushOp({ t: "set", coll: "notices", id: id, f: p2 });
+        });
       });
       tr.querySelectorAll('input[data-p]').forEach(function (cb) {
         cb.addEventListener("change", function () {
@@ -1103,12 +1594,16 @@
           var p = cb.getAttribute("data-p");
           if (cb.checked) { if (n.programs.indexOf(p) < 0) n.programs.push(p); }
           else { n.programs = n.programs.filter(function (x) { return x !== p; }); }
-          markDirty();
+          pushOp({ t: "set", coll: "notices", id: id, f: { programs: n.programs.slice() } });
         });
       });
       tr.querySelector(".rowdel").onclick = function () {
+        var n = findNotice(id);
+        var nm = (n && n.company) ? n.company : "선택한";
+        if (!confirm('“' + nm + '” 알림 대상을 삭제할까요?' + (LIVE ? "\n\n삭제는 즉시 저장되며 되돌릴 수 없습니다." : ""))) return;
         DATA.notices = DATA.notices.filter(function (x) { return x.id !== id; });
-        markDirty(); renderNotices();
+        pushOp({ t: "del", coll: "notices", ids: [id] });
+        renderNotices();
       };
     });
   }
@@ -1221,7 +1716,8 @@
     channel: ["문의경로", "경로", "유입경로"],
     contracted: ["계약여부", "계약", "계약상태", "상태"],
     amount: ["견적금액", "금액", "견적", "계약금액", "견적가"],
-    note: ["비고", "메모", "특이사항", "기타"]
+    note: ["비고", "메모", "특이사항", "기타"],
+    owner: ["접수자", "등록자", "처리자", "작성자", "우리담당"]
   };
   var NOTICE_KEYS = {
     date: ["등록일", "날짜", "일자", "등록날짜"],
@@ -1233,12 +1729,13 @@
     note: ["비고", "메모", "특이사항", "기타"]
   };
 
-  function importCustomers(rows) {
-    var cfg = ws(), n = 0;
+  // startId 는 서버가 발급한 번호 블록의 시작값 (직원끼리 번호가 겹치지 않도록)
+  function importCustomers(rows, startId) {
+    var cfg = ws(), n = 0, nextId = startId;
     rows.forEach(function (r) {
       if (!rowHasData(r)) return;
       var row = {
-        id: DATA[cfg.nextIdKey]++,
+        id: nextId++,
         date: toDateStr(rowVal(r, CUST_KEYS.date)),
         company: String(rowVal(r, CUST_KEYS.company) || "").trim(),
         manager: String(rowVal(r, CUST_KEYS.manager) || "").trim(),
@@ -1249,6 +1746,7 @@
         contracted: mapContract(rowVal(r, CUST_KEYS.contracted)),
         amount: parseAmount(rowVal(r, CUST_KEYS.amount)),
         note: String(rowVal(r, CUST_KEYS.note) || "").trim(),
+        owner: String(rowVal(r, CUST_KEYS.owner) || "").trim(),
         images: []
       };
       row[cfg.catField] = mapCategoryValue(rowVal(r, CUST_KEYS.cat));
@@ -1257,12 +1755,12 @@
     });
     return n;
   }
-  function importNotices(rows) {
-    var n = 0;
+  function importNotices(rows, startId) {
+    var n = 0, nextId = startId;
     rows.forEach(function (r) {
       if (!rowHasData(r)) return;
       DATA.notices.push({
-        id: DATA.nextNoticeId++,
+        id: nextId++,
         date: toDateStr(rowVal(r, NOTICE_KEYS.date)),
         company: String(rowVal(r, NOTICE_KEYS.company) || "").trim(),
         manager: String(rowVal(r, NOTICE_KEYS.manager) || "").trim(),
@@ -1299,32 +1797,48 @@
       if (err) { alert("엑셀을 읽을 수 없습니다.\n" + err.message); return; }
       if (!rows || !rows.length) { alert("데이터 행이 없습니다. 첫 행은 머리글이어야 합니다."); return; }
       var label = (kind === "customers") ? "문의" : "알림 대상";
-      if (!confirm(rows.length + "개 행을 현재 " + label + " 목록에 추가합니다. 진행할까요?")) return;
-      var n = (kind === "customers") ? importCustomers(rows) : importNotices(rows);
-      markDirty();
-      if (kind === "customers") renderCustomers(); else renderNotices();
-      alert(n + "건을 추가했습니다.\n내용을 확인한 뒤 상단 ‘저장하기’로 저장하세요.");
+      var valid = rows.filter(rowHasData);
+      if (!valid.length) { alert("내용이 있는 행이 없습니다. 첫 행은 머리글이어야 합니다."); return; }
+      if (!confirm(valid.length + "개 행을 현재 " + label + " 목록에 추가합니다. 진행할까요?" +
+        (LIVE ? "\n\n건수가 많아 추가 직후 곧바로 저장됩니다." : ""))) return;
+      var key = (kind === "customers") ? ws().nextIdKey : "nextNoticeId";
+      allocIds(key, valid.length, function (startId) {
+        var n = (kind === "customers") ? importCustomers(valid, startId) : importNotices(valid, startId);
+        markDirty();
+        if (kind === "customers") renderCustomers(); else renderNotices();
+        if (LIVE) {
+          // 대량 등록은 건 단위 기록으로 보내면 너무 무겁고, 저장하지 않은 채 두면
+          // 다른 직원의 저장과 부딪혀 사라질 수 있으므로 바로 전체 저장한다.
+          setStatus("dirty", n + "건 추가 — 저장 중…");
+          flushOps(function () { serverSave(false); });
+          alert(n + "건을 추가했습니다. 저장까지 자동으로 진행됩니다.\n내용을 확인한 뒤 잘못된 행은 체크해서 삭제할 수 있습니다.");
+        } else {
+          alert(n + "건을 추가했습니다.\n내용을 확인한 뒤 상단 ‘저장하기’로 저장하세요.");
+        }
+      });
     });
   }
   function downloadTemplate(kind) {
     if (!window.XLSX) { alert("엑셀 라이브러리를 불러오지 못했습니다."); return; }
     var aoa, name, sheet, cols;
+    // 예시 행의 ‘접수자’ 칸은 지금 로그인한 이름을 넣어 두어, 무엇을 적는 칸인지 바로 알 수 있게 한다.
+    var meEx = ME || "홍길동";
     if (kind === "customers") {
       if (workspace === "gen") {
         aoa = [
-          ["날짜", "분류", "업체명", "담당자", "연락처", "이메일", "문의내용", "문의경로", "계약여부", "견적금액", "비고"],
-          ["2026-04-10", "기고객", "(예시)한빛상사", "최부장", "010-7777-8888", "gen1@example.com", "홈페이지 리뉴얼 견적 문의", "전화", "계약", 2000000, "기존 거래처"],
-          ["2026-06-02", "신규고객", "(예시)블루오션", "정대리", "010-9999-0000", "gen2@example.com", "로고·명함 디자인 문의", "홈페이지", "진행중", 500000, ""]
+          ["날짜", "분류", "업체명", "담당자", "연락처", "이메일", "문의내용", "문의경로", "계약여부", "견적금액", "비고", "접수자"],
+          ["2026-04-10", "기고객", "(예시)한빛상사", "최부장", "010-7777-8888", "gen1@example.com", "홈페이지 리뉴얼 견적 문의", "전화", "계약", 2000000, "기존 거래처", meEx],
+          ["2026-06-02", "신규고객", "(예시)블루오션", "정대리", "010-9999-0000", "gen2@example.com", "로고·명함 디자인 문의", "홈페이지", "진행중", 500000, "", meEx]
         ];
-        cols = [12, 10, 20, 10, 15, 22, 30, 10, 10, 12, 16];
+        cols = [12, 10, 20, 10, 15, 22, 30, 10, 10, 12, 16, 10];
         name = "일반고객_문의계약_대량등록양식.xlsx"; sheet = "일반고객";
       } else {
         aoa = [
-          ["날짜", "지원사업", "업체명", "담당자", "연락처", "이메일", "문의내용", "문의경로", "계약여부", "견적금액", "비고"],
-          ["2026-02-11", "수출바우처", "(예시)대영에스에프", "김대표", "010-1234-5678", "sample@example.com", "수출바우처 자부담 및 지원한도 문의", "홈페이지", "계약", 5000000, "3월 착수"],
-          ["2026-03-05", "혁신바우처", "(예시)준성테크", "이과장", "010-2222-3333", "sample2@example.com", "마케팅 컨설팅 견적 요청", "전화", "진행중", 3000000, "선정 결과 대기"]
+          ["날짜", "지원사업", "업체명", "담당자", "연락처", "이메일", "문의내용", "문의경로", "계약여부", "견적금액", "비고", "접수자"],
+          ["2026-02-11", "수출바우처", "(예시)대영에스에프", "김대표", "010-1234-5678", "sample@example.com", "수출바우처 자부담 및 지원한도 문의", "홈페이지", "계약", 5000000, "3월 착수", meEx],
+          ["2026-03-05", "혁신바우처", "(예시)준성테크", "이과장", "010-2222-3333", "sample2@example.com", "마케팅 컨설팅 견적 요청", "전화", "진행중", 3000000, "선정 결과 대기", meEx]
         ];
-        cols = [12, 14, 20, 10, 15, 22, 30, 10, 10, 12, 16];
+        cols = [12, 14, 20, 10, 15, 22, 30, 10, 10, 12, 16, 10];
         name = "정부지원사업_문의계약_대량등록양식.xlsx"; sheet = "문의계약";
       }
     } else {
@@ -1916,17 +2430,35 @@
     $("saveBtn").onclick = save;
     $("reloadBtn").onclick = function () {
       if (dirty && !confirm("저장하지 않은 변경사항이 사라집니다. 되돌릴까요?")) return;
+      dirty = false;
       loadData();
     };
+    $("meBtn").onclick = function () { askName(true); };
+    // 지금 커서가 놓인 칸을 기억해 둔다 → 남의 변경이 내 입력을 덮어쓰지 않게
+    document.addEventListener("focusin", function (e) { editing = fieldKeyOf(e.target); });
+    document.addEventListener("focusout", function () { editing = null; });
     document.querySelectorAll(".tab").forEach(function (b) { b.onclick = function () { switchTab(b.getAttribute("data-tab")); }; });
     document.querySelectorAll(".wsbtn").forEach(function (b) { b.onclick = function () { switchWorkspace(b.getAttribute("data-ws")); }; });
     $("cmClose").onclick = closeContract;
     $("contractModal").addEventListener("click", function (e) { if (e.target === this) closeContract(); });
     document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$("contractModal").classList.contains("hidden")) closeContract(); });
-    window.addEventListener("beforeunload", function (e) { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+    window.addEventListener("beforeunload", function (e) {
+      if (outbox.length) flushOps();                      // 마지막 변경을 놓치지 않게
+      if (dirty) { e.preventDefault(); e.returnValue = ""; }
+    });
     probeServer(function (hasServer) {
       STATIC = !hasServer;
-      if (!STATIC) { if (TOKEN) enterApp(); return; }
+      if (!STATIC) {
+        // 서버 모드 = 여러 직원이 동시에 쓰는 실시간 모드
+        LIVE = true;
+        $("meBtn").classList.remove("hidden");
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(function () { pullChanges(); }, 3000);
+        // 다른 창을 보다 돌아왔을 때는 기다리지 않고 바로 최신화
+        document.addEventListener("visibilitychange", function () { if (!document.hidden) pullChanges(); });
+        if (TOKEN) enterApp();
+        return;
+      }
       $("logoutBtn").textContent = "파일 닫기";
       $("saveBtn").textContent = canFS ? "저장하기" : "💾 data.json 내려받기";
       $("reloadBtn").textContent = "되돌리기";

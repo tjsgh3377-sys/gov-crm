@@ -1,7 +1,104 @@
-param([int]$Port = 0)
+﻿param([int]$Port = 0)
 if ($Port -eq 0) { if ($env:PORT) { $Port = [int]$env:PORT } else { $Port = 8741 } }
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+
+# ------------------------------------------------------------------
+# 여러 명이 동시에 써도 서로 덮어쓰지 않게 하는 구조
+#
+#   data.json   : 스냅샷. "어느 시점(snapRev)의 전체 자료"
+#   ops.jsonl   : 그 뒤에 일어난 변경만 한 줄씩 덧붙인 기록
+#   state.json  : snapRev 과 id 발급 번호
+#
+# 칸 하나를 고치면 그 칸의 변경만 ops.jsonl 에 쌓이므로, 두 사람이 각자 다른
+# 줄을 고쳐도 상대 것이 사라지지 않는다. HttpListener 는 요청을 한 번에 하나만
+# 처리하므로 이 덧붙이기 자체가 원자적이다.
+# ------------------------------------------------------------------
+$dataPath  = Join-Path $root 'data.json'
+$opsPath   = Join-Path $root 'ops.jsonl'
+$statePath = Join-Path $root 'state.json'
+$bakDir    = Join-Path $root 'backups'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+$script:snapRev  = 0
+$script:ops      = New-Object System.Collections.ArrayList
+$script:nextIds  = @{ nextId = 1; nextGenId = 1; nextNoticeId = 1 }
+
+function Get-Rev { return $script:snapRev + $script:ops.Count }
+
+function Write-State {
+  $o = [ordered]@{
+    snapRev      = $script:snapRev
+    nextId       = $script:nextIds.nextId
+    nextGenId    = $script:nextIds.nextGenId
+    nextNoticeId = $script:nextIds.nextNoticeId
+  }
+  [System.IO.File]::WriteAllText($statePath, ($o | ConvertTo-Json -Compress), $utf8NoBom)
+}
+
+function Initialize-Store {
+  if (Test-Path $statePath) {
+    try {
+      $s = Get-Content $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+      $script:snapRev = [int]$s.snapRev
+      foreach ($k in @('nextId', 'nextGenId', 'nextNoticeId')) {
+        if ($s.$k) { $script:nextIds[$k] = [int]$s.$k }
+      }
+    } catch { Write-Host "  state.json 을 읽지 못해 새로 만듭니다." -ForegroundColor Yellow }
+  } elseif (Test-Path $dataPath) {
+    # 처음 한 번만 data.json 을 읽어 id 발급 번호를 가져온다
+    try {
+      $d = Get-Content $dataPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      foreach ($k in @('nextId', 'nextGenId', 'nextNoticeId')) {
+        if ($d.$k) { $script:nextIds[$k] = [int]$d.$k }
+      }
+    } catch {}
+  }
+  if (Test-Path $opsPath) {
+    foreach ($ln in [System.IO.File]::ReadAllLines($opsPath, [System.Text.Encoding]::UTF8)) {
+      if ($ln -and $ln.Trim()) { [void]$script:ops.Add($ln) }
+    }
+  }
+  Write-State
+}
+
+# 변경 한 묶음을 ops.jsonl 에 덧붙이고 새 rev 를 돌려준다.
+# cid 는 보낸 브라우저의 임시 식별자. 각 브라우저가 "내가 보낸 변경"을 되받아
+# 지금 입력 중인 칸을 덮어쓰지 않도록 걸러내는 데 쓴다.
+function Add-Ops($opsJsonArray, $user, $cid) {
+  $r = (Get-Rev) + 1
+  $who = ($user | ConvertTo-Json -Compress)
+  if (-not $user) { $who = '""' }
+  $me = ($cid | ConvertTo-Json -Compress)
+  if (-not $cid) { $me = '""' }
+  $line = '{"rev":' + $r + ',"by":' + $who + ',"cid":' + $me + ',"at":"' + (Get-Date -Format 's') + '","ops":' + $opsJsonArray + '}'
+  [System.IO.File]::AppendAllText($opsPath, $line + "`n", $utf8NoBom)
+  [void]$script:ops.Add($line)
+  return $r
+}
+
+# 스냅샷 교체(엑셀 대량등록·업체 추가 등 큰 변경). 이전 스냅샷은 backups 에 남긴다
+function Set-Snapshot($bodyText) {
+  if (-not (Test-Path $bakDir)) { New-Item -ItemType Directory -Path $bakDir | Out-Null }
+  if (Test-Path $dataPath) {
+    Copy-Item $dataPath (Join-Path $bakDir ('data-' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.json')) -Force
+    Copy-Item $dataPath (Join-Path $root 'data.backup.json') -Force
+    # 최근 40개만 유지
+    Get-ChildItem $bakDir -Filter 'data-*.json' | Sort-Object LastWriteTime -Descending |
+      Select-Object -Skip 40 | ForEach-Object { Remove-Item $_.FullName -Force }
+  }
+  $tmp = $dataPath + '.tmp'
+  [System.IO.File]::WriteAllText($tmp, $bodyText, $utf8NoBom)
+  Move-Item $tmp $dataPath -Force
+  $script:snapRev = Get-Rev
+  $script:ops.Clear()
+  if (Test-Path $opsPath) { Remove-Item $opsPath -Force }
+  Write-State
+  return $script:snapRev
+}
+
+Initialize-Store
+
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://localhost:$Port/")
 $listener.Start()
@@ -18,7 +115,8 @@ $mime = @{
 }
 
 # 브라우저에 직접 노출하면 안 되는 파일 (data.json 은 인증된 API 로만 접근)
-$blocked = @('admin.config.json', 'serve.ps1', 'data.json', 'data.backup.json')
+$blocked = @('admin.config.json', 'serve.ps1', 'data.json', 'data.backup.json',
+             'ops.jsonl', 'state.json')
 
 $script:tempPw = $null
 function Get-Password {
@@ -87,25 +185,84 @@ while ($listener.IsListening) {
 
       if (-not $authed) { Send-Json $resp @{ ok = $false; error = 'unauthorized' } 401; continue }
 
+      # 스냅샷 내려주기. 이 응답이 담고 있는 시점은 X-Rev 헤더로 알려준다
       if ($path -eq '/api/data' -and $method -eq 'GET') {
-        $dp = Join-Path $root 'data.json'
-        if (-not (Test-Path $dp)) {
-          Send-Text $resp '{"meta":{"title":"고객관리 센터","programs":["수출바우처","혁신바우처","소공인판로개척지원사업","기타정부사업"],"categories":["기고객","신규고객"]},"nextId":1,"customers":[],"nextGenId":1,"genCustomers":[],"nextNoticeId":1,"notices":[]}' 200 'application/json; charset=utf-8'
+        $resp.Headers['X-Rev'] = [string]$script:snapRev
+        if (-not (Test-Path $dataPath)) {
+          Send-Text $resp '{"meta":{"title":"고객관리 센터","programs":["수출바우처","혁신바우처","소공인판로개척지원사업","기타정부사업"],"categories":["기고객","신규고객"],"staff":[]},"nextId":1,"customers":[],"nextGenId":1,"genCustomers":[],"nextNoticeId":1,"notices":[]}' 200 'application/json; charset=utf-8'
           continue
         }
-        Send-Text $resp (Get-Content $dp -Raw -Encoding UTF8) 200 'application/json; charset=utf-8'
+        Send-Text $resp (Get-Content $dataPath -Raw -Encoding UTF8) 200 'application/json; charset=utf-8'
         continue
       }
 
+      # 내가 본 시점(since) 이후 다른 사람이 바꾼 내용만 받아간다 (3초마다 호출)
+      if ($path -eq '/api/changes' -and $method -eq 'GET') {
+        $since = 0
+        if ($req.QueryString['since']) { try { $since = [int]$req.QueryString['since'] } catch {} }
+        if ($since -lt $script:snapRev) {
+          # 그 사이 스냅샷이 새로 만들어져 변경 기록이 정리됐다 → 전체를 다시 받아야 한다
+          Send-Text $resp ('{"ok":true,"reload":true,"rev":' + (Get-Rev) + '}') 200 'application/json; charset=utf-8'
+          continue
+        }
+        $take = @()
+        $skip = $since - $script:snapRev
+        if ($skip -lt $script:ops.Count) { $take = $script:ops[$skip..($script:ops.Count - 1)] }
+        Send-Text $resp ('{"ok":true,"rev":' + (Get-Rev) + ',"lines":[' + ($take -join ',') + ']}') 200 'application/json; charset=utf-8'
+        continue
+      }
+
+      # 변경 한 묶음 기록. 본문은 op 객체들의 배열
+      if ($path -eq '/api/patch' -and $method -eq 'POST') {
+        $body = [System.Text.Encoding]::UTF8.GetString((Read-BodyBytes $req))
+        # JSON 문법상 문자열 안에 생 줄바꿈은 못 들어오므로, 남은 줄바꿈은 토큰 사이 공백이라 안전하게 치환된다
+        $body = $body.Replace("`r", ' ').Replace("`n", ' ')
+        $parsed = $null
+        try { $parsed = $body | ConvertFrom-Json } catch { Send-Json $resp @{ ok = $false; error = 'invalid json' } 400; continue }
+        if ($parsed -isnot [System.Array]) { Send-Json $resp @{ ok = $false; error = 'ops array required' } 400; continue }
+        if ($parsed.Count -eq 0) { Send-Text $resp ('{"ok":true,"rev":' + (Get-Rev) + '}') 200 'application/json; charset=utf-8'; continue }
+        $user = $req.Headers['X-User']
+        if ($user) { try { $user = [System.Uri]::UnescapeDataString($user) } catch {} }
+        $newRev = Add-Ops $body $user $req.Headers['X-Client']
+        Send-Text $resp ('{"ok":true,"rev":' + $newRev + '}') 200 'application/json; charset=utf-8'
+        continue
+      }
+
+      # 새 줄에 붙일 id 를 서버가 발급한다 (직원끼리 같은 id 를 쓰지 않도록)
+      if ($path -eq '/api/newid' -and $method -eq 'POST') {
+        $body = [System.Text.Encoding]::UTF8.GetString((Read-BodyBytes $req))
+        $key = $null; $n = 1
+        try { $q = $body | ConvertFrom-Json; $key = $q.key; if ($q.n) { $n = [int]$q.n } } catch {}
+        if (-not $script:nextIds.ContainsKey([string]$key)) { Send-Json $resp @{ ok = $false; error = 'unknown key' } 400; continue }
+        if ($n -lt 1) { $n = 1 }
+        if ($n -gt 20000) { $n = 20000 }
+        $start = $script:nextIds[[string]$key]
+        $script:nextIds[[string]$key] = $start + $n
+        Write-State
+        Send-Text $resp ('{"ok":true,"start":' + $start + ',"n":' + $n + '}') 200 'application/json; charset=utf-8'
+        continue
+      }
+
+      # 전체 스냅샷 교체 (엑셀 대량등록·업체 추가처럼 큰 변경).
+      # X-Rev 가 서버의 현재 rev 와 다르면 그 사이 누군가 바꿨다는 뜻이라 거절한다.
       if ($path -eq '/api/save' -and $method -eq 'POST') {
         $body = [System.Text.Encoding]::UTF8.GetString((Read-BodyBytes $req))
-        try { $null = $body | ConvertFrom-Json } catch { Send-Json $resp @{ ok = $false; error = 'invalid json' } 400; continue }
-        # 저장 전 백업 1부 유지
-        $dp = Join-Path $root 'data.json'
-        if (Test-Path $dp) { Copy-Item $dp (Join-Path $root 'data.backup.json') -Force }
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($dp, $body, $utf8)
-        Send-Json $resp @{ ok = $true }
+        $obj = $null
+        try { $obj = $body | ConvertFrom-Json } catch { Send-Json $resp @{ ok = $false; error = 'invalid json' } 400; continue }
+        $cli = $req.Headers['X-Rev']
+        if ($cli -ne $null -and $cli -ne '') {
+          $cliRev = -1
+          try { $cliRev = [int]$cli } catch {}
+          if ($cliRev -ne (Get-Rev)) {
+            Send-Text $resp ('{"ok":false,"stale":true,"rev":' + (Get-Rev) + '}') 409 'application/json; charset=utf-8'
+            continue
+          }
+        }
+        foreach ($k in @('nextId', 'nextGenId', 'nextNoticeId')) {
+          if ($obj.$k) { $v = [int]$obj.$k; if ($v -gt $script:nextIds[$k]) { $script:nextIds[$k] = $v } }
+        }
+        $r = Set-Snapshot $body
+        Send-Text $resp ('{"ok":true,"rev":' + $r + '}') 200 'application/json; charset=utf-8'
         continue
       }
 

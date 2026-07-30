@@ -84,7 +84,16 @@
     .pager input[type=number]{ width:64px; text-align:center; }
     .pager button[disabled]{ opacity:.4; cursor:default; }
 
+    /* 선택 삭제 바 */
+    .selbar{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; padding:9px 13px; background:#fff6f5; border:1px solid #f6d5d1; border-radius:10px; }
+    .selbar .selcnt{ font-size:13px; color:#b42318; margin-right:auto; }
+    .selbar .selcnt b{ font-size:14.5px; }
+
     /* 테이블 */
+    th.selcol, td.selcol{ width:36px; text-align:center; padding:6px 4px; }
+    .selcol input[type=checkbox]{ width:16px; height:16px; cursor:pointer; accent-color:var(--mint-dark); }
+    tbody tr.selrow{ background:#fff6f5; }
+    tbody tr.selrow:hover{ background:#ffeceb; }
     .tablewrap{ background:#fff; border:1px solid var(--line); border-radius:12px; overflow:auto; }
     table{ border-collapse:collapse; width:100%; font-size:13px; min-width:1150px; }
     thead th{ background:#f7f9fb; border-bottom:1px solid var(--line); text-align:left; padding:9px 9px; font-weight:700; color:#41474f; white-space:nowrap; }

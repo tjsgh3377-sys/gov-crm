@@ -20,7 +20,23 @@
   // 대량 데이터(수천 건) 렉 방지: 문의·계약 표를 페이지 단위로 렌더
   var custPage = { gov: 1, gen: 1 };
   var CUST_PAGE_SIZE = 100;
-  function resetCustPage() { custPage[workspace] = 1; }
+  // 선택 삭제용 체크 상태 (id → true). 페이지를 넘겨도 유지되지만, 보이는 범위(필터·검색·분류탭)가
+  // 바뀌면 안 보이는 항목을 지우게 되므로 선택을 비운다.
+  var custSel = { gov: {}, gen: {} };
+  function resetCustPage() { custPage[workspace] = 1; clearSel(); }
+  function selMap() { return custSel[workspace]; }
+  function clearSel() { custSel[workspace] = {}; }
+  // 목록에 실제로 남아있는 id만 돌려준다(삭제·필터 변경으로 생긴 잔여 선택 정리)
+  function selIds() {
+    var m = selMap(), out = [];
+    curList().forEach(function (c) { if (m[c.id]) out.push(c.id); });
+    return out;
+  }
+  function deleteCustomers(ids) {
+    var kill = {};
+    ids.forEach(function (id) { kill[id] = true; delete selMap()[id]; });
+    DATA[ws().list] = curList().filter(function (c) { return !kill[c.id]; });
+  }
 
   // ===== 홈페이지 유지보수 탭 상태/상수 =====
   var MENUS = ["홈·기본정보", "회사소개", "제품소개", "사업영역", "기술력",
@@ -359,7 +375,7 @@
     });
     document.querySelectorAll(".tab").forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-tab") === curTab); });
     if (isMaint) { renderMaint(); return; }
-    $("whoCount").textContent = ws().noun + " " + curList().length + "건 · 알림대상 " + DATA.notices.length + "곳";
+    refreshWho();
     if (curTab === "customers") renderCustomers();
     else if (curTab === "stats") renderStats();
     else renderNotices();
@@ -407,9 +423,14 @@
     });
   }
 
+  function refreshWho() {
+    $("whoCount").textContent = ws().noun + " " + curList().length + "건 · 알림대상 " + DATA.notices.length + "곳";
+  }
+
   function renderCustomers() {
     var host = $("tab-customers");
     host.innerHTML = "";
+    refreshWho();
 
     // 분류(기고객/신규고객·지원사업) 하위 탭
     renderCatSubtabs(host);
@@ -451,6 +472,15 @@
       '<button class="btn tiny" id="addRow">+ 문의 추가</button>';
     host.appendChild(tb);
 
+    // 선택 삭제 바 (선택된 항목이 있을 때만 보인다)
+    var selbar = el("div", { class: "selbar hidden", id: "selBar" });
+    selbar.innerHTML =
+      '<span class="selcnt"><b id="selCnt">0</b>건 선택됨</span>' +
+      '<button class="btn ghost tiny hidden" id="selAllFiltered"></button>' +
+      '<button class="btn ghost tiny" id="selClear">선택 해제</button>' +
+      '<button class="btn danger tiny" id="delSel">🗑 선택 삭제</button>';
+    host.appendChild(selbar);
+
     // 페이지 계산 (대량 데이터 렉 방지)
     var total = rows.length;
     var pages = Math.max(1, Math.ceil(total / CUST_PAGE_SIZE));
@@ -465,6 +495,7 @@
     } else {
       var table = el("table");
       table.innerHTML = "<thead><tr>" +
+        '<th class="selcol"><input type="checkbox" id="selAll" title="이 페이지 전체선택"></th>' +
         "<th>번호</th><th>날짜</th><th>업체명</th><th>담당자</th><th>연락처</th>" +
         "<th>이메일</th><th>문의내용</th><th>문의경로</th><th>계약여부</th><th>견적금액</th><th>비고</th><th>계약내용</th><th></th>" +
         "</tr></thead>";
@@ -473,10 +504,13 @@
       pageRows.forEach(function (c, i) {
         var tr = el("tr");
         tr.setAttribute("data-id", c.id);
+        var picked = !!selMap()[c.id];
+        if (picked) tr.className = "selrow";
         var chanOpts = CHANNELS.map(function (v) { return '<option value="' + esc(v) + '"' + (c.channel === v ? " selected" : "") + ">" + esc(v) + "</option>"; }).join("");
         var contOptsRow = CONTRACT.map(function (v) { return '<option value="' + esc(v) + '"' + (c.contracted === v ? " selected" : "") + ">" + esc(v) + "</option>"; }).join("");
         var catTag = (cf().cat === "__all" && c[catField]) ? '<span class="cattag">' + esc(c[catField]) + '</span> ' : "";
         tr.innerHTML =
+          '<td class="selcol"><input type="checkbox" class="rowsel"' + (picked ? " checked" : "") + '></td>' +
           '<td class="no">' + (start + i + 1) + '</td>' +
           '<td class="date"><input type="date" data-f="date" value="' + esc(c.date) + '"></td>' +
           '<td>' + catTag + '<input type="text" data-f="company" value="' + esc(c.company) + '" style="min-width:120px"></td>' +
@@ -533,6 +567,33 @@
     $("tplCust").onclick = function () { downloadTemplate("customers"); };
     $("fileCust").onchange = function () { handleUpload(this, "customers"); };
 
+    var selAllCb = $("selAll");
+    if (selAllCb) selAllCb.onchange = function () {
+      var on = this.checked;
+      pageBoxes().forEach(function (b) { b.checked = on; applyBox(b); });
+      refreshSelUI();
+    };
+    $("selClear").onclick = function () {
+      clearSel();
+      pageBoxes().forEach(function (b) { b.checked = false; b.parentNode.parentNode.classList.remove("selrow"); });
+      refreshSelUI();
+    };
+    $("selAllFiltered").onclick = function () {
+      var m = selMap();
+      filteredCustomers().forEach(function (c) { m[c.id] = true; });
+      pageBoxes().forEach(function (b) { b.checked = true; b.parentNode.parentNode.classList.add("selrow"); });
+      refreshSelUI();
+    };
+    $("delSel").onclick = function () {
+      var ids = selIds();
+      if (!ids.length) return;
+      if (!confirm(ids.length.toLocaleString("ko-KR") + "건의 문의를 삭제할까요?\n\n(상단 “저장하기”를 눌러야 최종 반영됩니다)")) return;
+      deleteCustomers(ids);
+      markDirty();
+      renderCustomers();
+    };
+    refreshSelUI();
+
     wrap.querySelectorAll("tbody tr").forEach(function (tr) {
       var id = Number(tr.getAttribute("data-id"));
       tr.querySelectorAll("[data-f]").forEach(function (inp) {
@@ -556,11 +617,49 @@
           markDirty(); renderCustomers();
         });
       });
+      var scb = tr.querySelector(".rowsel");
+      if (scb) scb.addEventListener("change", function () { applyBox(this); refreshSelUI(); });
       tr.querySelector(".rowdel").onclick = function () {
-        DATA[ws().list] = curList().filter(function (x) { return x.id !== id; });
+        var c = findCust(id);
+        var nm = (c && c.company) ? c.company : "선택한";
+        if (!confirm('“' + nm + '” 문의를 삭제할까요?\n\n(상단 “저장하기”를 눌러야 최종 반영됩니다)')) return;
+        deleteCustomers([id]);
         markDirty(); renderCustomers();
       };
     });
+  }
+
+  // ---------- 문의 선택(체크박스) ----------
+  function pageBoxes() {
+    return Array.prototype.slice.call(document.querySelectorAll("#tab-customers tbody .rowsel"));
+  }
+  function applyBox(box) {
+    var tr = box.parentNode.parentNode;
+    var id = Number(tr.getAttribute("data-id"));
+    if (box.checked) selMap()[id] = true; else delete selMap()[id];
+    tr.classList.toggle("selrow", box.checked);
+  }
+  function refreshSelUI() {
+    var bar = $("selBar"); if (!bar) return;
+    var ids = selIds();
+    var total = filteredCustomers().length;
+    $("selCnt").textContent = ids.length.toLocaleString("ko-KR");
+    bar.classList.toggle("hidden", ids.length === 0);
+    $("delSel").disabled = ids.length === 0;
+
+    // 현재 페이지 밖에도 대상이 남아있으면 "필터된 전체 선택"을 제안
+    var allBtn = $("selAllFiltered");
+    var canAll = ids.length > 0 && total > ids.length && total > CUST_PAGE_SIZE;
+    allBtn.classList.toggle("hidden", !canAll);
+    if (canAll) allBtn.textContent = "조건에 맞는 전체 " + total.toLocaleString("ko-KR") + "건 선택";
+
+    var cb = $("selAll");
+    if (cb) {
+      var boxes = pageBoxes();
+      var on = boxes.filter(function (b) { return b.checked; }).length;
+      cb.checked = boxes.length > 0 && on === boxes.length;
+      cb.indeterminate = on > 0 && on < boxes.length;
+    }
   }
 
   // ---------- 문의 첨부 이미지 ----------

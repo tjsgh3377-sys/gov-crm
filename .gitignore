@@ -2,7 +2,10 @@
 data.json
 data.backup.json
 data.damaged-*.json
+안전보관_*.json
 uploads/
+*.xlsx
+_*.py
 
 # 비밀번호
 admin.config.json

@@ -1166,16 +1166,29 @@
     if (!v && active !== "__all") return active;
     return mapProgram(v);
   }
+  // 엑셀 문의경로 칸에는 "홈페이지(메일)", "기타\n(전화)" 처럼 메모가 붙은 값이 많다.
+  // 여러 항목이 섞여 있으면 맨 앞에 적힌 것이 실제 경로이므로 가장 먼저 나온 항목을 택한다.
+  var CHANNEL_ALIAS = [
+    ["전화", ["전화", "유선"]],
+    ["이메일", ["이메일", "메일"]],
+    ["채널톡", ["채널톡", "채널"]],
+    ["카카오톡", ["카카오", "카톡"]],
+    ["홈페이지", ["홈페이지", "홈패이지", "웹"]],
+    ["소개", ["소개", "지인"]],
+    ["기타", ["기타"]]
+  ];
   function mapChannel(v) {
     v = String(v == null ? "" : v).trim(); if (!v) return "홈페이지";
     for (var i = 0; i < CHANNELS.length; i++) if (CHANNELS[i] === v) return CHANNELS[i];
-    if (v.indexOf("카톡") >= 0 || v.indexOf("카카오") >= 0) return "카카오톡";
-    if (v.indexOf("채널") >= 0) return "채널톡";
-    if (v.indexOf("메일") >= 0) return "이메일";
-    if (v.indexOf("전화") >= 0 || v.indexOf("유선") >= 0) return "전화";
-    if (v.indexOf("홈페이지") >= 0 || v.indexOf("웹") >= 0) return "홈페이지";
-    if (v.indexOf("소개") >= 0 || v.indexOf("지인") >= 0) return "소개";
-    return "기타";
+    var best = "", at = -1;
+    for (i = 0; i < CHANNEL_ALIAS.length; i++) {
+      var words = CHANNEL_ALIAS[i][1];
+      for (var j = 0; j < words.length; j++) {
+        var p = v.indexOf(words[j]);
+        if (p >= 0 && (at < 0 || p < at)) { at = p; best = CHANNEL_ALIAS[i][0]; }
+      }
+    }
+    return best || "기타";
   }
   function mapContract(v) {
     v = String(v == null ? "" : v).trim();
@@ -1268,7 +1281,10 @@
     var reader = new FileReader();
     reader.onload = function (e) {
       try {
-        var wb = XLSX.read(new Uint8Array(e.target.result), { type: "array", cellDates: true });
+        // cellDates 를 쓰면 SheetJS 가 엑셀 날짜를 1899년 기준 시간대(서울 LMT +8:27:52)로 되돌려
+        // 자정에서 52초 모자란 값이 되고, 결과적으로 하루 앞 날짜가 된다.
+        // 날짜 셀은 원본 숫자로 받아 toDateStr 에서 XLSX.SSF 로 정확히 환산한다.
+        var wb = XLSX.read(new Uint8Array(e.target.result), { type: "array" });
         var ws = wb.Sheets[wb.SheetNames[0]];
         cb(null, XLSX.utils.sheet_to_json(ws, { defval: "", raw: true }));
       } catch (err) { cb(err); }

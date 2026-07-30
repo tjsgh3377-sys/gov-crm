@@ -1986,11 +1986,12 @@
   function pageInfo(co, it) {
     var pg = pageFile(it);
     if (!pg) return null;
-    var isTest = !!(co && co.previewBase);
-    var base = String((co && (co.previewBase || co.site)) || "").replace(/\/+$/, "");
+    // 항상 업체 정보의 '홈페이지 URL' 을 쓴다.
+    // (예전에는 개발용 previewBase(localhost)가 우선이라 밖에서는 열리지 않았다)
+    var base = String((co && co.site) || "").replace(/\/+$/, "");
     var url = base ? base + "/" + pg : null;
     if (url && it.path) url += "?edit=" + encodeURIComponent(it.path);
-    return { url: url, label: PAGE_LABEL[pg] || pg, isTest: isTest };
+    return { url: url, label: PAGE_LABEL[pg] || pg, isTest: false };
   }
   function mntCompany() {
     if (!DATA || !DATA.companies) return null;

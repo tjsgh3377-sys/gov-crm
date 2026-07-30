@@ -136,6 +136,30 @@ function Get-Password {
   return $script:tempPw
 }
 
+# 직원에게 보내는 링크에 넣는 열쇠.
+# 비밀번호와 따로 두는 이유: 비밀번호를 바꿔도 이미 보낸 링크가 살아 있고,
+# 반대로 링크가 새어 나가면 이 열쇠만 지워서 링크 전부를 한 번에 무효화할 수 있다.
+function Get-LinkKey {
+  $cfgPath = Join-Path $root 'admin.config.json'
+  $cfg = $null
+  if (Test-Path $cfgPath) {
+    try { $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+  }
+  if ($cfg -and $cfg.linkKey) { return [string]$cfg.linkKey }
+  # 아직 없으면 한 번만 만들어 설정 파일에 적어 둔다 (다음 실행에도 같은 링크가 유지되게)
+  $chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+  $key = -join (1..28 | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+  if (-not $cfg) { $cfg = [pscustomobject]@{ password = (Get-Password) } }
+  $cfg | Add-Member -NotePropertyName linkKey -NotePropertyValue $key -Force
+  try {
+    [System.IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 5), $utf8NoBom)
+    Write-Host "  직원 링크 열쇠를 새로 만들었습니다 (admin.config.json 에 저장)." -ForegroundColor Yellow
+  } catch {
+    Write-Host "  admin.config.json 에 링크 열쇠를 저장하지 못했습니다. 다시 실행하면 열쇠가 바뀝니다." -ForegroundColor Red
+  }
+  return $key
+}
+
 function Read-BodyBytes($req) {
   $ms = New-Object System.IO.MemoryStream
   $req.InputStream.CopyTo($ms)
@@ -171,19 +195,27 @@ while ($listener.IsListening) {
 
     # ---------- API ----------
     if ($path.StartsWith('/api/')) {
+      # 비밀번호로 들어오든 링크 열쇠로 들어오든 똑같이 인정한다
       $token = $req.Headers['X-Admin-Token']
-      $authed = ($token -and ($token -eq (Get-Password)))
+      $authed = ($token -and (($token -eq (Get-Password)) -or ($token -eq (Get-LinkKey))))
 
       if ($path -eq '/api/login' -and $method -eq 'POST') {
         $body = [System.Text.Encoding]::UTF8.GetString((Read-BodyBytes $req))
         $pw = $null
         try { $pw = ($body | ConvertFrom-Json).password } catch {}
         if ($pw -eq (Get-Password)) { Send-Json $resp @{ ok = $true; token = (Get-Password) } }
+        elseif ($pw -eq (Get-LinkKey)) { Send-Json $resp @{ ok = $true; token = (Get-LinkKey) } }
         else { Send-Json $resp @{ ok = $false; error = 'invalid password' } 401 }
         continue
       }
 
       if (-not $authed) { Send-Json $resp @{ ok = $false; error = 'unauthorized' } 401; continue }
+
+      # 직원에게 보낼 링크를 앱에서 만들 수 있도록 열쇠를 알려준다
+      if ($path -eq '/api/linkkey' -and $method -eq 'GET') {
+        Send-Json $resp @{ ok = $true; key = (Get-LinkKey) }
+        continue
+      }
 
       # 스냅샷 내려주기. 이 응답이 담고 있는 시점은 X-Rev 헤더로 알려준다
       if ($path -eq '/api/data' -and $method -eq 'GET') {

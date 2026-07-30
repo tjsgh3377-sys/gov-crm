@@ -5,7 +5,44 @@
   var CONTRACT = ["계약", "진행중", "미계약"];
   var CHANNELS = ["전화", "이메일", "채널톡", "카카오톡", "홈페이지", "소개", "기타"];
 
-  var TOKEN = sessionStorage.getItem("govToken") || "";
+  // ------------------------------------------------------------------
+  // 직원용 링크 (#k=열쇠&n=이름)
+  //
+  // 직원에게 주소·비밀번호·이름 세 가지를 안내하는 대신 링크 하나만 보내면
+  // 되도록, 링크에 열쇠와 이름을 실어 보낸다. 링크를 열면 바로 자료가 뜬다.
+  // 열쇠는 주소창에 남기지 않고 곧바로 지운다(어깨너머로 보이거나 다른 사람에게
+  // 화면 주소를 복사해 주는 실수를 막기 위함). 로그인 상태는 이 브라우저에
+  // 남으므로 다음부터는 링크 없이 주소만으로도 들어올 수 있다.
+  // ------------------------------------------------------------------
+  var linkParams = (function () {
+    var out = {};
+    var h = String(location.hash || "").replace(/^#/, "");
+    if (!h) return out;
+    h.split("&").forEach(function (kv) {
+      var i = kv.indexOf("=");
+      if (i < 0) return;
+      try { out[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1).replace(/\+/g, " ")); } catch (e) {}
+    });
+    if (out.k || out.n) {
+      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    }
+    return out;
+  })();
+
+  function savedToken() {
+    // 예전 버전은 sessionStorage 를 썼다(브라우저를 닫으면 로그인이 풀림).
+    // 이제는 localStorage 에 남겨 매번 비밀번호를 치지 않게 한다.
+    try {
+      var t = localStorage.getItem("govToken");
+      if (t) return t;
+      var old = sessionStorage.getItem("govToken");
+      if (old) { localStorage.setItem("govToken", old); return old; }
+    } catch (e) {}
+    return "";
+  }
+
+  var TOKEN = linkParams.k || savedToken();
+  if (linkParams.k) { try { localStorage.setItem("govToken", TOKEN); } catch (e) {} }
   var DATA = null;
   var dirty = false;
   var curTab = "customers";
@@ -130,7 +167,9 @@
   // ==================================================================
   var LIVE = false;                              // 실시간 동기화 사용 중인가
   var REV = 0;                                   // 내가 반영을 마친 서버 시점
-  var ME = localStorage.getItem("govStaff") || ""; // 로그인한 직원 이름
+  // 링크에 이름이 실려 있으면 그 이름으로 시작한다(직원이 아무것도 고르지 않아도 되게)
+  var ME = linkParams.n || localStorage.getItem("govStaff") || "";
+  if (linkParams.n) { try { localStorage.setItem("govStaff", linkParams.n); } catch (e) {} }
   var CID = Math.random().toString(36).slice(2) + "-" + Date.now().toString(36); // 이 브라우저 식별자
   var outbox = [];        // 아직 서버로 보내지 못한 변경
   var sendTimer = null;
@@ -461,6 +500,83 @@
     if (canCancel && $("nmCancel")) $("nmCancel").onclick = function () { box.classList.add("hidden"); };
     setTimeout(function () { var n = $("nmNew"); if (n && !st.length) n.focus(); }, 30);
   }
+  // 직원에게 보낼 링크를 만들어 준다. 이름을 넣으면 그 직원 전용 링크가 되고,
+  // 받은 사람은 클릭 한 번으로 비밀번호·이름 입력 없이 바로 자료를 본다.
+  function openShareLink() {
+    var box = $("shareModal");
+    if (!box) { box = el("div", { id: "shareModal", class: "modal" }); document.body.appendChild(box); }
+    var st = staffList();
+    box.innerHTML =
+      '<div class="modal-card" style="width:520px">' +
+        '<div class="modal-head"><h2>🔗 직원 링크 만들기</h2><button class="x" id="shClose">✕</button></div>' +
+        '<div style="padding:20px 24px 24px">' +
+          '<div style="font-size:13px;color:var(--muted);line-height:1.65;margin-bottom:14px">' +
+            '직원 이름을 넣고 링크를 복사해 카카오톡 등으로 보내세요.<br>' +
+            '받은 사람이 링크를 누르면 <b>비밀번호도 이름도 입력하지 않고</b> 바로 자료가 뜹니다.</div>' +
+          '<div id="shWarn" class="hidden" style="font-size:12.5px;line-height:1.7;background:#fff7ed;border:1px solid #fdba74;color:#9a3412;border-radius:8px;padding:11px 13px;margin-bottom:14px"></div>' +
+          '<input type="text" id="shName" list="shNames" placeholder="직원 이름 (예: 홍길동)" style="width:100%">' +
+          '<datalist id="shNames">' + st.map(function (s) { return '<option value="' + esc(s) + '">'; }).join("") + '</datalist>' +
+          '<div style="display:flex;gap:8px;margin-top:10px">' +
+            '<input type="text" id="shUrl" readonly placeholder="이름을 넣으면 링크가 만들어집니다" style="flex:1;background:#f8fafc;font-size:12px">' +
+            '<button class="btn" id="shCopy">복사</button>' +
+          '</div>' +
+          '<div id="shMsg" class="msg" style="font-size:12.5px;min-height:18px;margin-top:8px"></div>' +
+          '<div style="font-size:12px;color:var(--muted);line-height:1.6;margin-top:10px;border-top:1px solid var(--line);padding-top:10px">' +
+            '⚠ 이 링크를 가진 사람은 누구나 고객정보를 볼 수 있습니다. 사내에서만 공유하세요.<br>' +
+            '링크가 외부로 샜다면 <b>admin.config.json</b> 의 <b>linkKey</b> 값을 지우고 서버를 다시 켜면 이전 링크가 모두 막힙니다.</div>' +
+        '</div>' +
+      '</div>';
+    box.classList.remove("hidden");
+
+    // 내 PC 안에서만 통하는 주소(localhost / 192.168.x.x 등)로 링크를 만들면
+    // 직원 휴대폰에서는 절대 열리지 않는다. 가장 흔한 실수라 미리 막는다.
+    var host = String(location.hostname || "");
+    var isLocal = (host === "localhost" || host === "127.0.0.1" || host === "" ||
+                   /^192\.168\./.test(host) || /^10\./.test(host) ||
+                   /^172\.(1[6-9]|2\d|3[01])\./.test(host));
+
+    var keyCache = null;
+    function build() {
+      var nm = String($("shName").value || "").trim();
+      if (!keyCache) { $("shUrl").value = ""; return; }
+      var base = location.origin + location.pathname;
+      $("shUrl").value = base + "#k=" + encodeURIComponent(keyCache) + (nm ? "&n=" + encodeURIComponent(nm) : "");
+    }
+
+    if (isLocal) {
+      $("shWarn").innerHTML =
+        '<b>⚠ 지금 만드는 링크는 이 PC 에서만 열립니다.</b><br>' +
+        '지금 보고 계신 주소(<b>' + esc(location.host || "localhost") + '</b>)는 내 컴퓨터 안 주소라, ' +
+        '직원 휴대폰·다른 PC 에서는 열리지 않습니다.<br><br>' +
+        '<b>이렇게 하세요</b><br>' +
+        '1) <b>인터넷공유_실행.bat</b> 을 더블클릭합니다.<br>' +
+        '2) 검은 창에 나오는 <b>https://…trycloudflare.com</b> 주소를 복사합니다.<br>' +
+        '3) 그 주소를 <b>내 브라우저 주소창에 붙여넣어</b> 다시 들어옵니다.<br>' +
+        '4) 거기서 이 [🔗 직원 링크] 를 다시 눌러 링크를 만드세요.';
+      $("shWarn").classList.remove("hidden");
+    }
+    function keyFailed() {
+      $("shMsg").className = "msg err";
+      $("shMsg").textContent = "링크 열쇠를 가져오지 못했습니다. 서버를 다시 켠 뒤 시도하세요.";
+    }
+    api("/api/linkkey", "GET").then(function (r) {
+      if (r.status !== 200 || !r.j || !r.j.key) { keyFailed(); return; }
+      keyCache = r.j.key; build();
+    }, keyFailed);
+    $("shName").oninput = build;
+    $("shCopy").onclick = function () {
+      var v = $("shUrl").value;
+      if (!v) { $("shMsg").className = "msg err"; $("shMsg").textContent = "먼저 직원 이름을 입력하세요."; return; }
+      var done = function () { $("shMsg").className = "msg ok"; $("shMsg").textContent = "✓ 복사했습니다. 붙여넣어 보내세요."; };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(v).then(done, function () { $("shUrl").select(); done(); });
+      } else { $("shUrl").select(); try { document.execCommand("copy"); } catch (e) {} done(); }
+    };
+    $("shClose").onclick = function () { box.classList.add("hidden"); };
+    box.onclick = function (e) { if (e.target === box) box.classList.add("hidden"); };
+    setTimeout(function () { var n = $("shName"); if (n) n.focus(); }, 30);
+  }
+
   function setMe(v) {
     ME = v;
     try { localStorage.setItem("govStaff", v); } catch (e) {}
@@ -640,7 +756,7 @@
       .then(function (res) {
         if (res.status === 200 && res.j.ok) {
           TOKEN = res.j.token || pw;
-          sessionStorage.setItem("govToken", TOKEN);
+          try { localStorage.setItem("govToken", TOKEN); } catch (e) {}
           enterApp();
         } else {
           $("loginErr").textContent = "비밀번호가 올바르지 않습니다.";
@@ -725,7 +841,8 @@
     }
     flushOps();                                     // 보내지 못한 변경을 먼저 넘긴다
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    sessionStorage.removeItem("govToken"); TOKEN = "";
+    try { localStorage.removeItem("govToken"); sessionStorage.removeItem("govToken"); } catch (e) {}
+    TOKEN = "";
     $("app").classList.add("hidden"); $("login").classList.remove("hidden");
   }
 
@@ -2434,6 +2551,7 @@
       loadData();
     };
     $("meBtn").onclick = function () { askName(true); };
+    $("linkBtn").onclick = openShareLink;
     // 지금 커서가 놓인 칸을 기억해 둔다 → 남의 변경이 내 입력을 덮어쓰지 않게
     document.addEventListener("focusin", function (e) { editing = fieldKeyOf(e.target); });
     document.addEventListener("focusout", function () { editing = null; });
@@ -2452,9 +2570,12 @@
         // 서버 모드 = 여러 직원이 동시에 쓰는 실시간 모드
         LIVE = true;
         $("meBtn").classList.remove("hidden");
+        $("linkBtn").classList.remove("hidden");
         if (pollTimer) clearInterval(pollTimer);
-        pollTimer = setInterval(function () { pullChanges(); }, 3000);
-        // 다른 창을 보다 돌아왔을 때는 기다리지 않고 바로 최신화
+        // 8초마다 남의 변경을 받아온다. 화면을 안 보고 있을 때(다른 탭·잠금)는
+        // 굳이 물어보지 않는다 — 클라우드의 무료 사용량을 아끼기 위함이고,
+        // 돌아오는 순간 바로 최신화하므로 체감 차이는 없다.
+        pollTimer = setInterval(function () { if (!document.hidden) pullChanges(); }, 8000);
         document.addEventListener("visibilitychange", function () { if (!document.hidden) pullChanges(); });
         if (TOKEN) enterApp();
         return;

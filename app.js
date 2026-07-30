@@ -3,7 +3,7 @@
   "use strict";
 
   var CONTRACT = ["계약", "진행중", "미계약"];
-  var CHANNELS = ["홈페이지", "전화", "이메일", "소개", "방문", "SNS", "기타"];
+  var CHANNELS = ["전화", "이메일", "채널톡", "카카오톡", "홈페이지", "소개", "기타"];
 
   var TOKEN = sessionStorage.getItem("govToken") || "";
   var DATA = null;
@@ -1169,6 +1169,12 @@
   function mapChannel(v) {
     v = String(v == null ? "" : v).trim(); if (!v) return "홈페이지";
     for (var i = 0; i < CHANNELS.length; i++) if (CHANNELS[i] === v) return CHANNELS[i];
+    if (v.indexOf("카톡") >= 0 || v.indexOf("카카오") >= 0) return "카카오톡";
+    if (v.indexOf("채널") >= 0) return "채널톡";
+    if (v.indexOf("메일") >= 0) return "이메일";
+    if (v.indexOf("전화") >= 0 || v.indexOf("유선") >= 0) return "전화";
+    if (v.indexOf("홈페이지") >= 0 || v.indexOf("웹") >= 0) return "홈페이지";
+    if (v.indexOf("소개") >= 0 || v.indexOf("지인") >= 0) return "소개";
     return "기타";
   }
   function mapContract(v) {

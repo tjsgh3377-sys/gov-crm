@@ -1,6 +1,7 @@
 # 고객 개인정보 — 절대 커밋 금지
 data.json
 data.backup.json
+data.damaged-*.json
 uploads/
 
 # 비밀번호

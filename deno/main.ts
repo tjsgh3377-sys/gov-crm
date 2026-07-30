@@ -61,16 +61,20 @@ const DEFAULT_META = {
 // 변경기록을 몇 개까지 들고 있을지. 이보다 오래된 건 지우고, 그때는 전체를 다시 받게 한다.
 const OPS_KEEP = 3000;
 const CHUNK = 60000;          // 첨부파일 조각 크기 (KV 한 칸 64KB 제한)
-const MAX_MUTATIONS = 900;    // KV 한 번의 원자적 처리에 넣을 수 있는 개수 여유값
-const MAX_BATCH_BYTES = 600000; // 한 번에 보낼 수 있는 총 크기 여유값
+const MAX_MUTATIONS = 500;    // KV 한 번의 원자적 처리에 넣을 수 있는 개수 여유값
+const MAX_BATCH_BYTES = 400000; // 한 번에 보낼 수 있는 총 크기 여유값 (KV 한도는 약 800KB)
+
+const enc = new TextEncoder();
 
 // 개수와 크기를 모두 지켜 가며 나눠 저장한다.
-// (문의 한 줄이 길면 900개가 크기 한도를 먼저 넘기 때문에 둘 다 본다)
+//
+// 크기는 반드시 "바이트"로 재야 한다. 한글은 UTF-8 에서 한 글자가 3바이트라,
+// 글자 수로 재면 실제 크기의 1/3 로 잘못 보고 한도를 넘겨 버린다.
 async function putBatched(puts: { key: Deno.KvKey; value: unknown }[]) {
   let at = kv.atomic();
   let n = 0, bytes = 0;
   for (const p of puts) {
-    const size = JSON.stringify(p.value).length + 100;
+    const size = enc.encode(JSON.stringify(p.value)).length + 100;
     if (n > 0 && (n >= MAX_MUTATIONS || bytes + size > MAX_BATCH_BYTES)) {
       await at.commit();
       at = kv.atomic();
@@ -527,6 +531,72 @@ Deno.serve(async (req: Request) => {
       return jsonRes({ ok: true, rev });
     }
 
+    // ------------------------------------------------------------------
+    //  처음 한 번, 내 PC 의 data.json 을 클라우드로 옮길 때 쓰는 통로.
+    //
+    //  /api/save 처럼 한 번에 다 보내면 4,700건을 한 요청에서 처리하느라
+    //  무료 등급의 처리시간 한도를 넘긴다. 그래서 몇 백 건씩 나눠 받는다.
+    // ------------------------------------------------------------------
+    if (path === "/api/import" && method === "POST") {
+      let q: Record<string, unknown>;
+      try { q = await req.json(); } catch { return jsonRes({ ok: false, error: "invalid json" }, 400); }
+      const step = String(q.step || "");
+
+      if (step === "begin") {
+        for (const coll of COLLS) {
+          const kill: Deno.KvKey[] = [];
+          for await (const e of kv.list({ prefix: ["row", coll] }, { batchSize: 500 })) kill.push(e.key);
+          await delBatched(kill);
+        }
+        const kill: Deno.KvKey[] = [];
+        for await (const e of kv.list({ prefix: ["ops"] }, { batchSize: 500 })) kill.push(e.key);
+        await delBatched(kill);
+        const st = (await getState()).value;
+        const rev = st.rev + 1;
+        await kv.set(["state"], { ...st, rev, floor: rev, ordLo: 0, ordHi: 1 });
+        return jsonRes({ ok: true, rev });
+      }
+
+      if (step === "rows") {
+        const coll = q.coll;
+        if (!isColl(coll)) return jsonRes({ ok: false, error: "unknown coll" }, 400);
+        const rows = Array.isArray(q.rows) ? (q.rows as Row[]) : [];
+        const st = (await getState()).value;
+        let ord = st.ordHi;
+        const puts: { key: Deno.KvKey; value: unknown }[] = [];
+        const nk = NEXT_KEY[coll];
+        let maxId = st[nk];
+        for (const r of rows) {
+          if (!r || r.id == null) continue;
+          puts.push({ key: ["row", coll, r.id], value: { ...r, _ord: ord++ } });
+          if (Number(r.id) >= maxId) maxId = Number(r.id) + 1;
+        }
+        await putBatched(puts);
+        await kv.set(["state"], { ...st, ordHi: ord, [nk]: maxId });
+        return jsonRes({ ok: true, added: puts.length, ordHi: ord });
+      }
+
+      if (step === "docs") {
+        if (q.meta) await kv.set(["doc", "meta"], q.meta);
+        if (q.companies) await kv.set(["doc", "companies"], q.companies);
+        return jsonRes({ ok: true });
+      }
+
+      if (step === "end") {
+        const st = (await getState()).value;
+        const next = { ...st };
+        for (const coll of COLLS) {
+          const nk = NEXT_KEY[coll];
+          const given = Number(q[nk]);
+          if (given && given > next[nk]) next[nk] = given;
+        }
+        await kv.set(["state"], next);
+        return jsonRes({ ok: true, rev: next.rev });
+      }
+
+      return jsonRes({ ok: false, error: "unknown step" }, 400);
+    }
+
     if (path === "/api/upload" && method === "POST") {
       return await handleUpload(req, IMG_EXT, "img", 10 * 1024 * 1024);
     }
@@ -536,7 +606,10 @@ Deno.serve(async (req: Request) => {
 
     return jsonRes({ ok: false, error: "not found" }, 404);
   } catch (e) {
+    // 무엇이 잘못됐는지 바로 알 수 있게 오류 문구를 함께 돌려준다.
+    // (KV·서버 자체의 오류 문구라 고객정보는 들어가지 않는다)
     console.error(path, e);
-    return jsonRes({ ok: false, error: "server error" }, 500);
+    const msg = e instanceof Error ? e.message : String(e);
+    return jsonRes({ ok: false, error: "server error", detail: msg }, 500);
   }
 });

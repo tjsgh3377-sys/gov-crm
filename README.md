@@ -5,7 +5,7 @@
 
 ## 1) 링크로 바로 쓰기 (GitHub Pages)
 
-> https://USERNAME.github.io/REPO/
+> https://tjsgh3377-sys.github.io/gov-crm/
 
 접속하면 `data.json`을 여는 화면이 나옵니다.
 

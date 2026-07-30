@@ -12,7 +12,7 @@
 //
 //    ["state"]                     → 현재 시점(rev)·id 발급번호
 //    ["row", 컬렉션, id]            → 문의 한 줄
-//    ["doc", "meta" | "companies"] → 설정·업체 목록
+//    ["doc", "meta"|"companies", 조각번호] → 설정·업체 목록 (64KB 씩 나눠 담음)
 //    ["ops", rev]                  → 변경 한 묶음 (3초마다 직원들이 받아감)
 //    ["blob", 파일명, 조각번호]      → 첨부파일 (KV 한 칸이 64KB 라 나눠 담는다)
 //
@@ -105,6 +105,50 @@ function jsonRes(obj: unknown, status = 200, headers?: Record<string, string>) {
 }
 function textRes(text: string, status = 200, type = "text/plain; charset=utf-8") {
   return new Response(text, { status, headers: { "content-type": type } });
+}
+
+// ------------------------------------------------------------------
+//  설정(meta)·업체목록(companies) 담기
+//
+//  KV 한 칸에는 64KB 까지만 들어간다. 업체목록은 그보다 커질 수 있으므로
+//  (지금도 107KB) 글자를 UTF-8 바이트로 바꿔 조각내어 나눠 담는다.
+//  바이트로 잘라야 한글이 중간에서 반 토막 나지 않는다.
+// ------------------------------------------------------------------
+const dec = new TextDecoder();
+
+async function setDoc(name: string, value: unknown) {
+  // 지우고 넘어갈 옛 조각이 몇 개인지 먼저 알아 둔다 (덮어쓴 뒤에는 알 수 없다)
+  const old = (await kv.get<{ parts: number }>(["docinfo", name])).value;
+
+  const bytes = enc.encode(JSON.stringify(value));
+  const parts = Math.ceil(bytes.length / CHUNK) || 1;
+  // 조각을 먼저 넣고 마지막에 개수를 적는다 → 읽는 쪽이 반쪽짜리를 보지 않는다
+  for (let i = 0; i < parts; i++) {
+    await kv.set(["doc", name, i], bytes.slice(i * CHUNK, (i + 1) * CHUNK));
+  }
+  await kv.set(["docinfo", name], { parts });
+
+  // 내용이 줄어 조각 수가 적어졌다면 남은 옛 조각을 치운다
+  if (old && old.parts > parts) {
+    for (let i = parts; i < old.parts; i++) await kv.delete(["doc", name, i]);
+  }
+}
+
+async function getDoc<T>(name: string, fallback: T): Promise<T> {
+  const info = (await kv.get<{ parts: number }>(["docinfo", name])).value;
+  if (!info) return fallback;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (let i = 0; i < info.parts; i++) {
+    const c = (await kv.get<Uint8Array>(["doc", name, i])).value;
+    if (!c) return fallback;
+    chunks.push(c);
+    total += c.length;
+  }
+  const buf = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) { buf.set(c, at); at += c.length; }
+  try { return JSON.parse(dec.decode(buf)) as T; } catch { return fallback; }
 }
 
 // ---------- 상태 읽기 ----------
@@ -201,9 +245,12 @@ async function commitOps(ops: Op[], user: string, cid: string) {
       }
     }
 
+    // 설정은 조각내어 담기 때문에 원자적 묶음에 넣지 않고 따로 저장한다.
+    // (설정 변경은 이름 등록처럼 드물게 일어나고, 서로 겹칠 일이 없다)
+    let metaToWrite: Record<string, unknown> | null = null;
     if (metaPatch) {
-      const cur = (await kv.get<Record<string, unknown>>(["doc", "meta"])).value || DEFAULT_META;
-      writes.push({ key: ["doc", "meta"], value: { ...cur, ...metaPatch } });
+      const cur = await getDoc<Record<string, unknown>>("meta", DEFAULT_META);
+      metaToWrite = { ...cur, ...metaPatch };
     }
 
     const rev = st.rev + 1;
@@ -231,6 +278,7 @@ async function commitOps(ops: Op[], user: string, cid: string) {
     }
 
     if (ok) {
+      if (metaToWrite) await setDoc("meta", metaToWrite);
       pruneOps(next).catch(() => {});
       return rev;
     }
@@ -269,8 +317,8 @@ async function buildSnapshot() {
   const out: Record<string, unknown> = {};
   const st = (await getState()).value;
 
-  const meta = (await kv.get<Record<string, unknown>>(["doc", "meta"])).value || DEFAULT_META;
-  const companies = (await kv.get<unknown[]>(["doc", "companies"])).value || [];
+  const meta = await getDoc<Record<string, unknown>>("meta", DEFAULT_META);
+  const companies = await getDoc<unknown>("companies", []);
 
   out.meta = meta;
   for (const coll of COLLS) {
@@ -316,8 +364,8 @@ async function replaceSnapshot(doc: Record<string, unknown>) {
     const given = Number(doc[nk]);
     if (given && given > next[nk]) next[nk] = given;
   }
-  if (doc.meta) await kv.set(["doc", "meta"], doc.meta);
-  if (doc.companies) await kv.set(["doc", "companies"], doc.companies);
+  if (doc.meta) await setDoc("meta", doc.meta);
+  if (doc.companies) await setDoc("companies", doc.companies);
 
   // 변경기록을 전부 정리하고, 모든 직원이 전체를 다시 받도록 바닥(floor)을 올린다
   const kill: Deno.KvKey[] = [];
@@ -577,8 +625,8 @@ Deno.serve(async (req: Request) => {
       }
 
       if (step === "docs") {
-        if (q.meta) await kv.set(["doc", "meta"], q.meta);
-        if (q.companies) await kv.set(["doc", "companies"], q.companies);
+        if (q.meta) await setDoc("meta", q.meta);
+        if (q.companies) await setDoc("companies", q.companies);
         return jsonRes({ ok: true });
       }
 

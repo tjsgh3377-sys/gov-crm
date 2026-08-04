@@ -233,6 +233,23 @@
     .mnt-modal label{ display:block; font-size:12px; font-weight:600; color:var(--muted); margin:12px 0 5px; }
     .mnt-modal .row{ display:flex; gap:10px; justify-content:flex-end; margin-top:20px; }
     .hint{ font-size:12px; color:var(--muted); margin-top:5px; line-height:1.5; }
+    /* 홈페이지 고객관리 */
+    #tab-hpcust .tablewrap{ overflow-x:auto; }
+    #tab-hpcust table{ min-width:1720px; border-collapse:collapse; width:100%; }
+    #tab-hpcust th, #tab-hpcust td{ border:1px solid #e6e9ee; padding:5px 6px; vertical-align:top; font-size:12.5px; }
+    #tab-hpcust th{ background:#f4f6f9; font-weight:700; color:#4b5563; white-space:nowrap; text-align:left; position:sticky; top:0; z-index:1; }
+    #tab-hpcust td.num{ text-align:center; color:#6b7280; font-weight:600; width:42px; }
+    #tab-hpcust input, #tab-hpcust select, #tab-hpcust textarea{ width:100%; border:1px solid #dde1e7; border-radius:6px; padding:5px 6px; font-size:12.5px; font-family:inherit; box-sizing:border-box; }
+    #tab-hpcust input:focus, #tab-hpcust select:focus, #tab-hpcust textarea:focus{ outline:none; border-color:var(--mint); box-shadow:0 0 0 2px rgba(45,196,158,.15); }
+    #tab-hpcust textarea{ min-height:34px; resize:vertical; line-height:1.35; }
+    #tab-hpcust td.exp.warn input{ border-color:#e0930c; background:#fff7ea; }
+    #tab-hpcust td.exp.over input{ border-color:#dc3545; background:#fdecec; }
+    #tab-hpcust .adminbox{ display:flex; flex-direction:column; gap:4px; }
+    #tab-hpcust .adminbox .lbl{ font-size:10.5px; color:#9aa1ab; }
+    #tab-hpcust .lnkrow{ display:flex; gap:4px; align-items:center; }
+    #tab-hpcust .lnkrow a{ flex:0 0 auto; text-decoration:none; font-size:14px; }
+    #tab-hpcust .rowdel{ background:none; border:0; color:#c0392b; font-size:16px; cursor:pointer; line-height:1; padding:2px 4px; }
+    #tab-hpcust .party-a{ color:#1d6fe0; } #tab-hpcust .party-b{ color:#7b3fe4; }
   </style>
 </head>
 <body>
@@ -256,6 +273,7 @@
           <button class="wsbtn active" data-ws="gov">🏛 정부지원사업 고객관리</button>
           <button class="wsbtn" data-ws="gen">👥 일반고객관리</button>
           <button class="wsbtn" data-ws="maint">🛠 홈페이지 유지보수</button>
+          <button class="wsbtn" data-ws="hpcust">🌐 홈페이지 고객관리</button>
         </div>
         <span class="sp"></span>
         <span class="who" id="whoCount"></span>
@@ -275,6 +293,7 @@
       <div id="tab-stats" class="hidden"></div>
       <div id="tab-notices" class="hidden"></div>
       <div id="tab-maint" class="hidden"></div>
+      <div id="tab-hpcust" class="hidden"></div>
     </main>
 
     <div class="savebar">
@@ -299,6 +318,6 @@
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <!-- GitHub Pages 가 js 를 10분 캐시하므로 app.js 를 고칠 때마다 v 를 올린다 -->
-  <script src="app.js?v=20260730g"></script>
+  <script src="app.js?v=20260804a"></script>
 </body>
 </html>

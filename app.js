@@ -106,6 +106,10 @@
   var mntSelId = null;
   var mntFilter = { menu: "", status: "__all", q: "", onlyReq: false };
 
+  // ===== 홈페이지 고객관리 탭 상태/상수 =====
+  var HP_PARTIES = ["퍼스트마케팅컴퍼니", "하오커뮤니케이션"];
+  var hpFilter = { party: "__all", q: "" };
+
   // 현재 워크스페이스 설정 (목록 키·분류 필드·분류 목록·라벨)
   function ws() {
     if (workspace === "gen") {
@@ -820,6 +824,7 @@
     DATA.nextGenId = DATA.nextGenId || 1;
     DATA.nextNoticeId = DATA.nextNoticeId || 1;
     DATA.companies = DATA.companies || [];
+    DATA.hpCustomers = DATA.hpCustomers || [];
     DATA.meta.staff = DATA.meta.staff || [];
     if (!mntSelId && DATA.companies.length) mntSelId = DATA.companies[0].id;
     invalidateStaff();
@@ -868,15 +873,19 @@
   function render() {
     if (!DATA) return;
     var isMaint = (workspace === "maint");
-    // 유지보수는 워크스페이스(대분류)라 상단 탭 바를 숨기고 전용 화면을 띄움
+    var isHp = (workspace === "hpcust");
+    var isBig = isMaint || isHp;
+    // 유지보수·홈페이지 고객관리는 워크스페이스(대분류)라 상단 탭 바를 숨기고 전용 화면을 띄움
     var tabsBar = document.querySelector(".tabs");
-    if (tabsBar) tabsBar.classList.toggle("hidden", isMaint);
+    if (tabsBar) tabsBar.classList.toggle("hidden", isBig);
     $("tab-maint").classList.toggle("hidden", !isMaint);
+    $("tab-hpcust").classList.toggle("hidden", !isHp);
     ["customers", "stats", "notices"].forEach(function (x) {
-      $("tab-" + x).classList.toggle("hidden", isMaint || x !== curTab);
+      $("tab-" + x).classList.toggle("hidden", isBig || x !== curTab);
     });
     document.querySelectorAll(".tab").forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-tab") === curTab); });
     if (isMaint) { renderMaint(); return; }
+    if (isHp) { renderHpCust(); return; }
     refreshWho();
     if (curTab === "customers") renderCustomers();
     else if (curTab === "stats") renderStats();
@@ -2010,6 +2019,167 @@
     }
     var pct = work ? Math.round(done / work * 100) : 0;
     return { total: total, work: work, done: done, doing: doing, hold: hold, pct: pct };
+  }
+
+  // ===== 홈페이지 고객관리 =====
+  function hpList() { return DATA.hpCustomers; }
+  function hpNewRow() {
+    return {
+      id: "hp" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      party: HP_PARTIES[0], company: "", manager: "", contact: "", email: "",
+      domainExp: "", hostExp: "", note: "", remark: "", staff: (ME || ""),
+      homeUrl: "", adminUrl: "", adminId: "", adminPw: ""
+    };
+  }
+  function hpFiltered() {
+    var q = hpFilter.q.trim().toLowerCase();
+    return hpList().filter(function (r) {
+      if (hpFilter.party !== "__all" && r.party !== hpFilter.party) return false;
+      if (q) {
+        var hay = [r.company, r.manager, r.contact, r.email, r.staff, r.homeUrl, r.adminUrl, r.note, r.remark].join(" ").toLowerCase();
+        if (hay.indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+  }
+  // 만료일 임박 판정: "" 없음/여유 / warn 30일 이내 / over 지남
+  function expClass(d) {
+    if (!d) return "";
+    var t = Date.parse(d); if (isNaN(t)) return "";
+    var days = Math.floor((t - Date.now()) / 86400000);
+    if (days < 0) return "over";
+    if (days <= 30) return "warn";
+    return "";
+  }
+
+  function renderHpCust() {
+    var host = $("tab-hpcust");
+    host.innerHTML = "";
+    invalidateStaff();
+    var mb = $("meBtn"); if (mb) mb.textContent = "👤 " + (ME || "이름 설정");
+
+    var all = hpList();
+    $("whoCount").textContent = "홈페이지 고객 " + all.length + "곳";
+
+    // 통계 카드
+    var cntA = all.filter(function (r) { return r.party === HP_PARTIES[0]; }).length;
+    var cntB = all.filter(function (r) { return r.party === HP_PARTIES[1]; }).length;
+    var warn = 0, over = 0;
+    all.forEach(function (r) {
+      [r.domainExp, r.hostExp].forEach(function (d) { var c = expClass(d); if (c === "over") over++; else if (c === "warn") warn++; });
+    });
+    var stats = el("div", { class: "stats" });
+    stats.innerHTML =
+      '<div class="stat total"><div class="n">' + all.length + '</div><div class="l">전체 업체</div></div>' +
+      '<div class="stat"><div class="n">' + cntA + '</div><div class="l">' + esc(HP_PARTIES[0]) + '</div></div>' +
+      '<div class="stat"><div class="n">' + cntB + '</div><div class="l">' + esc(HP_PARTIES[1]) + '</div></div>' +
+      '<div class="stat doing"><div class="n">' + warn + '</div><div class="l">만료 임박(30일 내)</div></div>' +
+      '<div class="stat req"><div class="n">' + over + '</div><div class="l">만료 지남</div></div>';
+    host.appendChild(stats);
+
+    // 툴바
+    var tb = el("div", { class: "toolbar" });
+    var partyOpts = '<option value="__all">전체 계약주체</option>' +
+      HP_PARTIES.map(function (p) { return '<option value="' + esc(p) + '"' + (hpFilter.party === p ? " selected" : "") + ">" + esc(p) + "</option>"; }).join("");
+    tb.innerHTML =
+      '<select id="hpParty">' + partyOpts + '</select>' +
+      '<input type="text" id="hpQ" placeholder="업체명·담당자·링크 검색" value="' + esc(hpFilter.q) + '">' +
+      '<span class="sp"></span>' +
+      '<button class="btn tiny" id="hpAdd">+ 업체 추가</button>';
+    host.appendChild(tb);
+    $("hpParty").onchange = function () { hpFilter.party = this.value; renderHpCust(); };
+    var qt; $("hpQ").oninput = function () { var v = this.value; clearTimeout(qt); qt = setTimeout(function () { hpFilter.q = v; renderHpCust(); }, 200); };
+    $("hpAdd").onclick = function () {
+      var row = hpNewRow();
+      if (hpFilter.party !== "__all") row.party = hpFilter.party;
+      DATA.hpCustomers.unshift(row);
+      markDirty(); renderHpCust();
+    };
+
+    // 테이블
+    var wrap = el("div", { class: "tablewrap" });
+    if (!all.length) {
+      wrap.innerHTML = '<div class="empty">아직 등록된 홈페이지 고객이 없습니다. “+ 업체 추가”로 등록하세요.</div>';
+      host.appendChild(wrap); return;
+    }
+    var rows = hpFiltered();
+    var thead =
+      '<thead><tr>' +
+      '<th>번호</th><th>계약주체</th><th>업체명</th><th>담당자</th><th>연락처</th><th>이메일</th>' +
+      '<th>도메인 만료일</th><th>호스팅 만료일</th><th>담당직원</th><th>홈페이지 링크</th>' +
+      '<th>관리자페이지 (링크·아이디·패스워드)</th><th>참고내용</th><th>비고</th><th></th>' +
+      '</tr></thead>';
+    var bodyHtml = "";
+    if (!rows.length) {
+      bodyHtml = '<tr><td colspan="14" class="empty">조건에 맞는 업체가 없습니다.</td></tr>';
+    } else {
+      rows.forEach(function (r, i) {
+        var pOpts = HP_PARTIES.map(function (p) { return "<option" + (r.party === p ? " selected" : "") + ">" + esc(p) + "</option>"; }).join("");
+        var dCls = expClass(r.domainExp), hCls = expClass(r.hostExp);
+        bodyHtml +=
+          '<tr data-id="' + esc(r.id) + '">' +
+          '<td class="num">' + (i + 1) + '</td>' +
+          '<td><select data-f="party" class="' + (r.party === HP_PARTIES[1] ? "party-b" : "party-a") + '">' + pOpts + '</select></td>' +
+          '<td><input data-f="company" value="' + esc(r.company) + '"></td>' +
+          '<td><input data-f="manager" value="' + esc(r.manager) + '"></td>' +
+          '<td><input data-f="contact" value="' + esc(r.contact) + '"></td>' +
+          '<td><input data-f="email" value="' + esc(r.email) + '"></td>' +
+          '<td class="exp ' + dCls + '"><input type="date" data-f="domainExp" value="' + esc(r.domainExp) + '"></td>' +
+          '<td class="exp ' + hCls + '"><input type="date" data-f="hostExp" value="' + esc(r.hostExp) + '"></td>' +
+          '<td><input data-f="staff" list="hpStaffList" value="' + esc(r.staff) + '"></td>' +
+          '<td><div class="lnkrow"><input data-f="homeUrl" placeholder="https://" value="' + esc(r.homeUrl) + '"><a class="open-link" data-src="homeUrl" title="새 창에서 열기">↗</a></div></td>' +
+          '<td><div class="adminbox">' +
+            '<div class="lnkrow"><input data-f="adminUrl" placeholder="관리자 URL" value="' + esc(r.adminUrl) + '"><a class="open-link" data-src="adminUrl" title="새 창에서 열기">↗</a></div>' +
+            '<input data-f="adminId" placeholder="아이디" value="' + esc(r.adminId) + '">' +
+            '<input data-f="adminPw" placeholder="패스워드" value="' + esc(r.adminPw) + '">' +
+          '</div></td>' +
+          '<td><textarea data-f="note">' + esc(r.note) + '</textarea></td>' +
+          '<td><textarea data-f="remark">' + esc(r.remark) + '</textarea></td>' +
+          '<td><button class="rowdel" title="이 업체 삭제">×</button></td>' +
+          '</tr>';
+      });
+    }
+    var table = el("table");
+    table.innerHTML = thead + "<tbody>" + bodyHtml + "</tbody>";
+    wrap.appendChild(table);
+    var dl = el("datalist", { id: "hpStaffList" });
+    dl.innerHTML = staffList().map(function (s) { return '<option value="' + esc(s) + '">'; }).join("");
+    wrap.appendChild(dl);
+    host.appendChild(wrap);
+
+    var tbody = table.querySelector("tbody");
+    function findRow(tr) {
+      var id = tr.getAttribute("data-id");
+      for (var j = 0; j < DATA.hpCustomers.length; j++) if (String(DATA.hpCustomers[j].id) === String(id)) return DATA.hpCustomers[j];
+      return null;
+    }
+    function onEdit(e) {
+      var t = e.target; var f = t.getAttribute && t.getAttribute("data-f");
+      if (!f) return;
+      var tr = t.closest("tr"); var r = findRow(tr); if (!r) return;
+      r[f] = t.value; markDirty();
+      if (f === "party") t.className = (t.value === HP_PARTIES[1] ? "party-b" : "party-a");
+      if (f === "domainExp" || f === "hostExp") { var cell = t.closest("td"); cell.className = "exp " + expClass(t.value); }
+    }
+    tbody.addEventListener("input", onEdit);
+    tbody.addEventListener("change", onEdit);
+    tbody.addEventListener("click", function (e) {
+      var a = e.target.closest && e.target.closest(".open-link");
+      if (a) {
+        var tr = a.closest("tr"); var r = findRow(tr); if (!r) return;
+        var url = String(r[a.getAttribute("data-src")] || "").trim();
+        if (!url) { alert("링크가 비어 있습니다."); return; }
+        if (!/^https?:\/\//i.test(url)) url = "http://" + url;
+        window.open(url, "_blank", "noopener");
+        return;
+      }
+      if (e.target.classList.contains("rowdel")) {
+        var tr2 = e.target.closest("tr"); var r2 = findRow(tr2); if (!r2) return;
+        if (!confirm('"' + (r2.company || "이 업체") + '" 을(를) 삭제할까요? (저장 시 반영)')) return;
+        DATA.hpCustomers = DATA.hpCustomers.filter(function (x) { return String(x.id) !== String(r2.id); });
+        markDirty(); renderHpCust();
+      }
+    });
   }
 
   function renderMaint() {

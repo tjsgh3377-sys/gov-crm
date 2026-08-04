@@ -319,6 +319,7 @@ async function buildSnapshot() {
 
   const meta = await getDoc<Record<string, unknown>>("meta", DEFAULT_META);
   const companies = await getDoc<unknown>("companies", []);
+  const hpCustomers = await getDoc<unknown>("hpCustomers", []);
 
   out.meta = meta;
   for (const coll of COLLS) {
@@ -335,6 +336,7 @@ async function buildSnapshot() {
     });
   }
   out.companies = companies;
+  out.hpCustomers = hpCustomers;
   return { snapshot: out, rev: st.rev };
 }
 
@@ -366,6 +368,7 @@ async function replaceSnapshot(doc: Record<string, unknown>) {
   }
   if (doc.meta) await setDoc("meta", doc.meta);
   if (doc.companies) await setDoc("companies", doc.companies);
+  if (doc.hpCustomers) await setDoc("hpCustomers", doc.hpCustomers);
 
   // 변경기록을 전부 정리하고, 모든 직원이 전체를 다시 받도록 바닥(floor)을 올린다
   const kill: Deno.KvKey[] = [];
@@ -627,6 +630,7 @@ Deno.serve(async (req: Request) => {
       if (step === "docs") {
         if (q.meta) await setDoc("meta", q.meta);
         if (q.companies) await setDoc("companies", q.companies);
+        if (q.hpCustomers) await setDoc("hpCustomers", q.hpCustomers);
         return jsonRes({ ok: true });
       }
 
